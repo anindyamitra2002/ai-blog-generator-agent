@@ -1,31 +1,40 @@
 """CLI entrypoint: orchestrates the full blog-generation pipeline.
 
-Six stages, executed in order:
-  0. Memory recall       — check Mem0 for similar past topics.
+Five stages, executed in order:
   1. Research phase      — agentic LangGraph deep-research loop: plan ->
                             search -> synthesize -> reflect (repeat until
                             the brief has dated, recent facts or the
-                            iteration budget runs out) -> finalize.
+                            iteration budget runs out) -> finalize. Uses a
+                            per-category prompt file (prompts/research/*.md)
+                            that forces the brief to be grounded ONLY in the
+                            search evidence collected this run.
   2. Outline generation  — fixed step; topic + research → Outline object.
   3. Section writing     — fixed step; once per outlined section.
   4. Editing pass        — fixed step; full draft → polished draft.
   5. Image + assembly    — fetch cover image, write post.md + meta.json.
-  6. Memory update       — record the completed post for future recall.
+
+NOTE ON MEMORY: the Mem0 recall/record stage that used to run before step 1
+and after step 5 has been REMOVED from this pipeline. It was recalling and
+surfacing old/stale content that ended up bleeding into new generations —
+the opposite of what a "must be current as of today" pipeline needs.
+``memory/mem0_store.py`` is still in the repo for reference, but nothing in
+this file imports or calls it anymore. If you want memory back, treat that
+as a deliberate, separate decision rather than re-enabling it silently.
 
 Usage:
     python main.py "the topic you want a blog post about"
     python main.py "some topic" --skip-image
+    python main.py "some very niche/local topic" --force-thin
 """
 
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 import io
 import warnings
 
-# Suppress deprecation and user warnings from third-party libraries (e.g., LangChain, LangGraph, Mem0)
+# Suppress deprecation and user warnings from third-party libraries (e.g., LangChain, LangGraph)
 warnings.filterwarnings("ignore")
 
 # Force stdout/stderr to use UTF-8 on Windows to prevent UnicodeEncodeError crashes
@@ -47,7 +56,6 @@ from agent.research_agent import build_research_agent, run_research, categorize_
 from chains.editor_chain import edit_draft  # noqa: E402
 from chains.outline_chain import generate_outline  # noqa: E402
 from chains.writer_chain import write_section  # noqa: E402
-from memory.mem0_store import Mem0Store  # noqa: E402
 from assembler import assemble_markdown  # noqa: E402
 from schemas import ImageResult  # noqa: E402
 from tools.image_tool import fetch_cover_image  # noqa: E402
@@ -108,24 +116,17 @@ def parse_args() -> argparse.Namespace:
         help="Skip the cover image fetch (e.g. when no image API keys are configured).",
     )
     p.add_argument(
-        "--skip-memory",
+        "--force-thin",
         action="store_true",
-        help="Skip the Mem0 recall/record steps (e.g. when mem0ai is not installed).",
+        help=(
+            "By default, if the search tools can't find substantive evidence for the "
+            "topic, the pipeline stops after the research phase rather than risking a "
+            "hallucinated post grounded in the LLM's own background knowledge. Pass "
+            "this flag to continue anyway and generate the post from whatever thin "
+            "evidence (or honest 'nothing found') the research phase produced."
+        ),
     )
     return p.parse_args()
-
-
-def extract_source_urls(text: str) -> list[str]:
-    """Pull unique URLs from the research brief, preserving order."""
-    urls = re.findall(r"https?://[^\s)\]\}<>]+", text)
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    for u in urls:
-        u = u.rstrip(".,;:!?")
-        if u not in seen:
-            seen.add(u)
-            cleaned.append(u)
-    return cleaned
 
 
 def main() -> int:
@@ -143,28 +144,8 @@ def main() -> int:
         print(f"[warning] {issue}")
 
     config.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    config.MEMORY_STORE_DIR.mkdir(parents=True, exist_ok=True)
 
     llm = build_llm()
-
-    # --- 0. Memory recall -------------------------------------------------
-    store: Mem0Store | None = None
-    if not args.skip_memory:
-        print_stage("Checking memory for similar past topics")
-        try:
-            store = Mem0Store()
-            similar = store.check_similar(topic)
-            if similar:
-                print("Found similar past topics:")
-                for h in similar:
-                    print(f"  - (score={h['score']:.2f}) {h['text']}")
-            else:
-                print("No similar past topics found.")
-        except Exception as e:
-            print(f"[warning] Memory recall skipped: {e}")
-            store = None
-    else:
-        print("[info] Memory step skipped (--skip-memory).")
 
     # --- 1. Research phase (deep-research LangGraph) -----------------------
     print_stage("Research phase (deep search)")
@@ -175,11 +156,33 @@ def main() -> int:
     print(f"  - Classified Category: {category.upper()}", flush=True)
 
     research_graph = build_research_agent(llm, category)
-    research_brief = run_research(research_graph, topic)
-    print(f"Research brief length: {len(research_brief)} chars")
+    research_result = run_research(research_graph, topic)
+    research_brief: str = research_result.get("brief", "")
+    sources: list[dict] = research_result.get("sources", [])
+    evidence_insufficient: bool = bool(research_result.get("evidence_insufficient", False))
 
-    source_urls = extract_source_urls(research_brief)
-    print(f"Extracted {len(source_urls)} source URL(s).")
+    print(f"Research brief length: {len(research_brief)} chars")
+    print(f"Extracted {len(sources)} distinct source(s) (target: {config.MIN_SOURCES_TARGET}+).")
+
+    if evidence_insufficient:
+        print(
+            "\n[warning] The search tools could not find substantive evidence for "
+            f"'{topic}'. Generating a post now risks the writer/editor stages leaning "
+            "on the LLM's own (possibly outdated or wrong) background knowledge "
+            "instead of verified sources.",
+            file=sys.stderr,
+        )
+        if not args.force_thin:
+            print(
+                "Stopping here to avoid a hallucinated post. Re-run with --force-thin "
+                "if you want to continue anyway with the limited/honest brief below, "
+                "or try a more specific/differently-worded topic so search can find it.\n",
+                file=sys.stderr,
+            )
+            print("--- Research brief so far ---\n")
+            print(research_brief)
+            return 3
+        print("[info] --force-thin set — continuing with the limited evidence available.\n")
 
     # --- 2. Outline generation --------------------------------------------
     print_stage("Outline generation")
@@ -241,7 +244,7 @@ def main() -> int:
         description=outline.meta_description,
         body_markdown=polished,
         image=image_result,
-        sources=source_urls,
+        sources=sources,
         outputs_root=config.OUTPUTS_DIR,
     )
 
@@ -251,20 +254,6 @@ def main() -> int:
     print(f"Metadata:        {meta_path}")
     if meta.cover_image_path:
         print(f"Cover image:     {Path(meta.output_dir) / meta.cover_image_path}")
-
-    # --- 6. Memory update -------------------------------------------------
-    if store is not None:
-        print_stage("Recording to memory")
-        try:
-            mem_id = store.record_post(
-                topic=topic,
-                title=meta.title,
-                output_path=str(post_path),
-                sources=meta.sources,
-            )
-            print(f"Recorded (memory id: {mem_id or 'n/a'}).")
-        except Exception as e:
-            print(f"[warning] Memory recording failed: {e}")
 
     print("\nDone.")
     return 0

@@ -23,14 +23,16 @@ OUTLINE_INSTRUCTIONS = """You are a content strategist. Given a topic and a rese
 Today's date is {today_human}. This post must read as current and up to date — not generic.
 
 CRITICAL INSTRUCTIONS FOR DETAIL PRESERVATION:
+- The research brief is your ONLY source of facts. Do not draw on your own training knowledge of this topic to add sections, key points, or facts that aren't actually present in the brief — even if you believe you know more about it. If the brief is thin on a topic, plan a thinner outline rather than inventing material to round it out.
 - Your primary goal is to ensure the outline is a detailed map of the concrete facts, figures, statistics, names, dates, and source references found in the research brief. Do NOT generalize, summarize vaguely, or smooth over details.
 - Every section's key points MUST list specific, concrete data points, dates, metrics, case studies, or names directly from the research brief.
 - Map the sources cited in the research brief across the outline sections, specifying which source domains or URLs must be referenced in each section.
 - Plan sections strictly based on what is covered in the research brief. Do NOT plan sections or key points for which there is no research material.
 
 CRITICAL INSTRUCTION FOR RECENCY:
-- At least one section MUST be dedicated to the most recent developments — title it something like "Latest Developments" or a topic-specific variant, and its key points must be the dated, recent facts from the research brief's "Recent developments" section, each anchored to a specific date where the research provides one.
-- If the research brief's "Recent developments" section is thin, fold what dated material exists into the most relevant thematic section instead of inventing a hollow section — but never omit it entirely if any dated recent fact exists in the brief.
+- If the research brief's "Recent developments" section contains real, dated facts, dedicate at least one section to them — title it something like "Latest Developments" or a topic-specific variant, with key points anchored to the specific dates the research provides.
+- If the research brief's "Recent developments" section is thin but has *some* dated material, fold it into the most relevant thematic section instead of inventing a hollow standalone section.
+- If the research brief explicitly states that no verified recent developments were found (or the section is empty), do NOT invent a "Latest Developments" section to satisfy this rule — build the outline entirely from whatever the brief does contain instead.
 
 The outline must include:
 - A catchy, SEO-friendly title (not clickbait).

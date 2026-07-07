@@ -71,6 +71,18 @@ class ImageResult(BaseModel):
     )
 
 
+class Source(BaseModel):
+    """A single citable source used to write the post.
+
+    Carries both a human-readable title and the URL so downstream markdown
+    rendering (assembler.py) can emit a proper ``[Title](URL)`` link instead
+    of a bare, unreadably-long URL in the Sources section.
+    """
+
+    title: str = Field(..., description="Human-readable source title or domain name.")
+    url: str = Field(..., description="The source's URL.")
+
+
 class PostMetadata(BaseModel):
     """Run metadata written to meta.json for debugging and resumability."""
 
@@ -83,7 +95,7 @@ class PostMetadata(BaseModel):
     )
     cover_image_path: str
     cover_image_credit: str
-    sources: list[str] = Field(default_factory=list)
+    sources: list[Source] = Field(default_factory=list)
     output_dir: str
 
 
@@ -99,11 +111,22 @@ class PlannedQuery(BaseModel):
         "tavily_deep",
         "serper_recent",
         "serper_deep",
+        "exa_recent",
+        "exa_deep",
+        "linkup_recent",
+        "linkup_deep",
         "wikipedia",
         "ddg_recent",
         "ddg_deep",
         "arxiv",
-    ] = Field(..., description="Which search tool to use for this query.")
+    ] = Field(
+        ...,
+        description=(
+            "Which search tool to use for this query. Prefer tavily/serper/exa/"
+            "linkup variants; ddg_recent/ddg_deep are a fallback of last resort "
+            "and should only be used when no other tool is available."
+        ),
+    )
     query: str = Field(..., description="The exact search query string to run.")
     reason: str = Field(
         default="", description="One short phrase on why this query is needed."
@@ -141,6 +164,7 @@ __all__ = [
     "Outline",
     "DraftedSection",
     "ImageResult",
+    "Source",
     "PostMetadata",
     "PlannedQuery",
     "QueryPlan",

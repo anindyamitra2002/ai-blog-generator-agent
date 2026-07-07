@@ -1,10 +1,13 @@
 """Assemble the final blog post: markdown + frontmatter + cover image.
 
-Given the polished body, title, description, image result, and source
-list, this module writes the finished markdown file to
-``outputs/<slug>/post.md`` with YAML frontmatter, downloads the cover
-image into ``outputs/<slug>/assets/``, and writes a ``meta.json`` for
-debugging / resumability.
+Given the polished body, title, description, image result, and a list of
+structured sources (title + url — see ``schemas.Source``), this module
+writes the finished markdown file to ``outputs/<slug>/post.md`` with YAML
+frontmatter, downloads the cover image into ``outputs/<slug>/assets/``,
+and writes a ``meta.json`` for debugging / resumability. Legacy callers
+that pass a plain list of URL strings are still supported (see
+``_coerce_sources``) — each bare URL gets its domain name as a fallback
+title so the Sources section never renders a raw, unreadable link.
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ from pathlib import Path
 import requests
 
 import config
-from schemas import ImageResult, PostMetadata
+from schemas import ImageResult, PostMetadata, Source
 
 
 def slugify(text: str) -> str:
@@ -42,13 +45,37 @@ def _yaml_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def _coerce_sources(sources: list) -> list[Source]:
+    """Accept either structured {title, url} dicts/Source objects (preferred)
+    or legacy bare URL strings, and normalize to a list of ``Source``.
+
+    Bare strings get the domain name as their title so the Sources section
+    never renders a raw, unreadably-long URL as the link text.
+    """
+    from urllib.parse import urlparse
+
+    out: list[Source] = []
+    for s in sources:
+        if isinstance(s, Source):
+            out.append(s)
+        elif isinstance(s, dict):
+            url = s.get("url", "")
+            title = s.get("title") or (urlparse(url).netloc or url)
+            out.append(Source(title=title, url=url))
+        else:
+            url = str(s)
+            title = urlparse(url).netloc or url
+            out.append(Source(title=title, url=url))
+    return out
+
+
 def assemble_markdown(
     topic: str,
     title: str,
     description: str,
     body_markdown: str,
     image: ImageResult,
-    sources: list[str],
+    sources: list,
     outputs_root: Path,
 ) -> PostMetadata:
     """Build the final markdown file with frontmatter + image + sources.
@@ -105,11 +132,18 @@ def assemble_markdown(
     currency_note = f"*Published {config.TODAY_HUMAN}. Data current as of this date.*\n\n"
 
     # --- Sources block ----------------------------------------------------
+    # Render each source as a proper markdown link — "- [Title](URL)" —
+    # rather than a bare URL. A bare URL as link text is what was making
+    # the rendered/preview post show long, unreadable raw links; wrapping
+    # it as [Title](URL) shows a short readable title while the URL still
+    # works as the link target.
+    resolved_sources = _coerce_sources(sources)
     sources_block = ""
-    if sources:
+    if resolved_sources:
         lines = ["## Sources\n"]
-        for s in sources:
-            lines.append(f"- {s}")
+        for s in resolved_sources:
+            safe_title = s.title.replace("[", "(").replace("]", ")").strip() or s.url
+            lines.append(f"- [{safe_title}]({s.url})")
         sources_block = "\n".join(lines) + "\n"
 
     # --- Title + body -----------------------------------------------------
@@ -138,7 +172,7 @@ def assemble_markdown(
         generated_date=date_str,
         cover_image_path=cover_image_rel,
         cover_image_credit=credit_line,
-        sources=sources,
+        sources=resolved_sources,
         output_dir=str(output_dir),
     )
     (output_dir / "meta.json").write_text(

@@ -29,7 +29,7 @@ Your job:
 3. Smooth the transitions between sections so the post reads as one continuous piece, not a list of standalone chunks, while retaining all details.
 4. Fix any awkward phrasing, grammatical issues, or redundancy.
 5. Preserve all factual claims and section headings — do not delete sections or rename headings.
-6. Do not add new facts not present in the draft.
+6. Do not add new facts not present in the draft — this includes filling in names, dates, numbers, or context from your own training knowledge, even in the intro/conclusion you're adding. Every fact in your intro and conclusion must already appear somewhere in the draft body.
 
 Return the complete polished post as Markdown in exactly this shape:
 

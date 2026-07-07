@@ -4,11 +4,20 @@ All tools here are maintained LangChain integrations — no custom search
 client or scraper code. Two flavors of most engines are provided:
 
   * a "recent" / "news" variant that is date-window restricted (Tavily's
-    native `topic="news"` + `days=`, Serper's `tbs=qdr:*` time filter, and
-    DuckDuckGo's `time=` window) — used by the deep-research graph whenever
-    it needs to answer "what happened recently".
+    native `topic="news"` + `days=`, Serper's `tbs=qdr:*` time filter, Exa's
+    `startPublishedDate`, Linkup's recency-biased query, and DuckDuckGo's
+    `time=` window) — used by the deep-research graph whenever it needs to
+    answer "what happened recently".
   * a "deep" / general variant with no time restriction — used for
     background, definitions, and canonical context.
+
+Primary engines, in preference order: Tavily, Serper, Exa, Linkup. Exa and
+Linkup are included specifically because they widen source coverage (Exa
+also returns full page contents per result, not just snippets) so the
+research brief has enough distinct, real sources to cite ten or more of
+them rather than three or four. DuckDuckGo (``ddg_recent`` / ``ddg_deep``)
+is a FALLBACK ONLY, used when none of the above are configured/available —
+the research graph's planner is instructed not to reach for it otherwise.
 
 The deep-research graph (``agent/research_agent.py``) decides for itself,
 per iteration, which of these tools to call and with what query, rather
@@ -17,10 +26,17 @@ than following a hardcoded call sequence.
 
 from __future__ import annotations
 
+import datetime as _dt
+
+import requests
 from langchain_core.tools import BaseTool, tool
 
 from config import (
     ENABLE_ARXIV,
+    EXA_API_KEY,
+    EXA_MAX_RESULTS,
+    LINKUP_API_KEY,
+    LINKUP_MAX_RESULTS,
     NEWS_RECENCY_DAYS,
     SERPER_API_KEY,
     TAVILY_API_KEY,
@@ -134,8 +150,11 @@ def build_search_toolkit(category: str = DEFAULT_CATEGORY) -> dict[str, BaseTool
     up ``toolkit[planned.tool].invoke({"query": planned.query})`` directly,
     without going through an agentic tool-selection loop.
 
-    Keys: tavily_news, tavily_deep, serper_recent, serper_deep, wikipedia,
-    ddg_recent, ddg_deep, arxiv (only if ENABLE_ARXIV / keys present).
+    Keys: tavily_news, tavily_deep, serper_recent, serper_deep, exa_recent,
+    exa_deep, linkup_recent, linkup_deep, wikipedia, ddg_recent, ddg_deep,
+    arxiv (only those with the relevant API key configured are present;
+    wikipedia is always present; ddg_recent/ddg_deep are always present as
+    the fallback-of-last-resort).
     """
     sources = CATEGORY_SOURCES.get(category, CATEGORY_SOURCES[DEFAULT_CATEGORY])
     toolkit: dict[str, BaseTool] = {}
@@ -221,9 +240,11 @@ def build_search_toolkit(category: str = DEFAULT_CATEGORY) -> dict[str, BaseTool
 
     @tool("ddg_recent")
     def ddg_recent(query: str) -> str:
-        """General-purpose web search restricted to results from the past
-        week, localized to India. Use for recent news when Tavily/Serper
-        are unavailable. Input is a search query string.
+        """FALLBACK ONLY. General-purpose web search restricted to results
+        from the past week, localized to India. Only use this when
+        tavily_news, serper_recent, exa_recent, and linkup_recent are all
+        unavailable — it is a last resort, not a primary choice. Input is a
+        search query string.
         """
         modified = modify_query_by_category(query, category)
         try:
@@ -240,9 +261,10 @@ def build_search_toolkit(category: str = DEFAULT_CATEGORY) -> dict[str, BaseTool
 
     @tool("ddg_deep")
     def ddg_deep(query: str) -> str:
-        """General-purpose web search localized to India, no time
-        restriction. Use for background, official releases, regional
-        references. Input is a search query string.
+        """FALLBACK ONLY. General-purpose web search localized to India, no
+        time restriction. Only use this when tavily_deep, serper_deep,
+        exa_deep, linkup_deep, and wikipedia are all unavailable — it is a
+        last resort, not a primary choice. Input is a search query string.
         """
         modified = modify_query_by_category(query, category)
         try:
@@ -330,6 +352,124 @@ def build_search_toolkit(category: str = DEFAULT_CATEGORY) -> dict[str, BaseTool
                 return f"Serper search failed: {e}"
 
         toolkit["serper_deep"] = serper_deep
+
+    # --- Exa: neural search with full page contents, recent + deep --------
+    if EXA_API_KEY:
+
+        def _exa_search(query: str, recent: bool) -> str:
+            headers = {"x-api-key": EXA_API_KEY, "Content-Type": "application/json"}
+            payload: dict = {
+                "query": query,
+                "type": "auto",
+                "numResults": EXA_MAX_RESULTS,
+                "includeDomains": sources,
+                "contents": {"text": {"maxCharacters": 2000}},
+            }
+            if recent:
+                start = (_dt.date.today() - _dt.timedelta(days=NEWS_RECENCY_DAYS)).isoformat()
+                payload["startPublishedDate"] = f"{start}T00:00:00.000Z"
+            resp = requests.post(
+                "https://api.exa.ai/search", headers=headers, json=payload, timeout=20
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            blocks = []
+            for r in data.get("results", []):
+                title = r.get("title", "Untitled")
+                url = r.get("url", "")
+                published = r.get("publishedDate", "")
+                text = (r.get("text") or "")[:2000]
+                blocks.append(
+                    f"Title: {title}\nURL: {url}\nPublished: {published}\nContent: {text}"
+                )
+            return "\n\n".join(blocks) if blocks else "No Exa results found."
+
+        @tool("exa_recent")
+        def exa_recent(query: str) -> str:
+            """Neural/semantic web search via Exa, restricted to the recent
+            news window and trusted category domains, returning each
+            result's title, URL, publish date, and full page text (not
+            just a snippet). Use this for 'latest developments' style
+            queries. Input is a search query string.
+            """
+            try:
+                return _exa_search(query, recent=True)
+            except Exception as e:
+                return f"Exa recent search failed: {e}"
+
+        toolkit["exa_recent"] = exa_recent
+
+        @tool("exa_deep")
+        def exa_deep(query: str) -> str:
+            """Neural/semantic web search via Exa, no time restriction,
+            restricted to trusted category domains, returning each result's
+            title, URL, and full page text (not just a snippet). Use for
+            background, definitions, and established context. Input is a
+            search query string.
+            """
+            try:
+                return _exa_search(query, recent=False)
+            except Exception as e:
+                return f"Exa search failed: {e}"
+
+        toolkit["exa_deep"] = exa_deep
+
+    # --- Linkup: web search with strong recency + source coverage ----------
+    if LINKUP_API_KEY:
+
+        def _linkup_search(query: str, recent: bool) -> str:
+            headers = {
+                "Authorization": f"Bearer {LINKUP_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            modified = modify_query_by_category(query, category)
+            if recent:
+                modified = f"{modified} latest {NEWS_RECENCY_DAYS} days"
+            payload = {
+                "q": modified,
+                "depth": "deep" if not recent else "standard",
+                "outputType": "searchResults",
+            }
+            resp = requests.post(
+                "https://api.linkup.so/v1/search", headers=headers, json=payload, timeout=20
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            blocks = []
+            for r in data.get("results", [])[: LINKUP_MAX_RESULTS]:
+                title = r.get("name", "Untitled")
+                url = r.get("url", "")
+                content = (r.get("content") or "")[:2000]
+                blocks.append(f"Title: {title}\nURL: {url}\nContent: {content}")
+            return "\n\n".join(blocks) if blocks else "No Linkup results found."
+
+        @tool("linkup_recent")
+        def linkup_recent(query: str) -> str:
+            """Web search via Linkup, biased toward the most recent
+            developments, returning each result's title, URL, and content.
+            Use for time-sensitive 'latest' queries. Input is a search
+            query string.
+            """
+            try:
+                return _linkup_search(query, recent=True)
+            except Exception as e:
+                return f"Linkup recent search failed: {e}"
+
+        toolkit["linkup_recent"] = linkup_recent
+
+        @tool("linkup_deep")
+        def linkup_deep(query: str) -> str:
+            """Deep web search via Linkup, no time restriction, returning
+            each result's title, URL, and content. Use for background,
+            definitions, and established context. Input is a search query
+            string.
+            """
+            try:
+                return _linkup_search(query, recent=False)
+            except Exception as e:
+                return f"Linkup search failed: {e}"
+
+        toolkit["linkup_deep"] = linkup_deep
 
     return toolkit
 

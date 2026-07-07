@@ -14,8 +14,12 @@ actually grounded in dated, recent information:
                     (no further LLM tool-choice ambiguity) against the
                     matching search tool, in parallel.
 * ``synthesize`` — LLM turns all collected search snippets into a single
-                    structured research brief, instructed to keep every
-                    date/statistic/URL it finds.
+                    structured research brief. It is instructed — via a
+                    category-specific prompt file loaded from
+                    ``prompts/research/<category>.md`` — to use ONLY the
+                    raw evidence collected this run, never its own training
+                    knowledge, and to say so explicitly when evidence is
+                    thin rather than filling gaps with invented content.
 * ``reflect``    — LLM checks its own brief: does it actually contain
                     dated, recent (last N days) facts with sources? If
                     not, it proposes follow-up queries and the graph loops
@@ -23,9 +27,16 @@ actually grounded in dated, recent information:
 * ``finalize``   — stamps the brief with the generation date and extracts
                     the final source-URL list.
 
+Category prompts (the "how to research this kind of topic" instructions,
+including trusted domains and the anti-hallucination rules) live entirely
+in ``prompts/research/*.md`` — one file per category — rather than being
+hardcoded in this module. Edit those files to change how a category is
+researched; this module only knows how to load and apply them.
+
 This gives genuinely agentic, iterative "deep search" behavior instead of a
 fixed 1-2-tool-call ceiling, while keeping each individual tool call
-deterministic and cheap.
+deterministic and cheap, and keeping every fact traceable to real search
+evidence collected during the run.
 """
 
 from __future__ import annotations
@@ -33,6 +44,8 @@ from __future__ import annotations
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
@@ -44,94 +57,80 @@ from tools.search_tools import build_search_toolkit
 
 from .state import ResearchState
 
+# ---------------------------------------------------------------------------
+# Category list — kept as plain keys here (used only for classification
+# matching and as filenames). The actual research instructions for each
+# category live in prompts/research/<key>.md.
+# ---------------------------------------------------------------------------
+CATEGORY_KEYS: list[str] = [
+    "geopolitics_international_relations",
+    "national_news_politics",
+    "artificial_intelligence_ml",
+    "software_development_programming",
+    "finance_investing_economics",
+    "health_medicine_healthcare",
+    "space_exploration_astronomy",
+    "climate_change_environment",
+    "legal_constitution_policy",
+    "education_academia",
+    "history_archaeology",
+    "cryptocurrency_blockchain",
+    "business_management_entrepreneurship",
+    "cybersecurity_privacy",
+    "automobile_transport",
+    "gadgets_consumer_electronics",
+    "agriculture_food_tech",
+    "sports_athletics",
+    "entertainment_media_pop_culture",
+    "travel_tourism_hospitality",
+    "sociology_anthropology_social_issues",
+]
+
 DEFAULT_CATEGORY = "geopolitics_international_relations"
 
-CATEGORY_INSTRUCTIONS = {
-    "geopolitics_international_relations": (
-        "Focus on international relations, foreign policy, diplomacy, and global treaties. "
-        "Your sources must be primarily major Indian news portals (ABP, NDTV, ANI, PTI), official government publications (PIB, Ministry of External Affairs), or established policy think-tanks."
-    ),
-    "national_news_politics": (
-        "Focus on domestic politics, governance, and national events. "
-        "Your sources must be major Indian news portals (ABP, NDTV, ANI, PTI) and government press releases."
-    ),
-    "artificial_intelligence_ml": (
-        "Focus on academic advancements in AI, machine learning models, and datasets. "
-        "Your sources must be academic papers (arXiv), official research blogs, and developer hubs (HuggingFace, PapersWithCode)."
-    ),
-    "software_development_programming": (
-        "Focus on coding tutorials, API references, software practices, and package documentation. "
-        "Your sources must be official docs, MDN, StackOverflow, GitHub repositories, or developer guides."
-    ),
-    "finance_investing_economics": (
-        "Focus on business, economic policy, market movements, and financial reports. "
-        "Your sources must be major financial publications (Economic Times, Livemint, Business Standard) and regulatory portals (RBI, Ministry of Finance)."
-    ),
-    "health_medicine_healthcare": (
-        "Focus on medical research, public health advisories, and bioscience. "
-        "Your sources must be trusted organizations (WHO), peer-reviewed research (PubMed, Lancet), and public health portals (Ministry of Health, ICMR)."
-    ),
-    "space_exploration_astronomy": (
-        "Focus on space missions, astronomical events, and space technology. "
-        "Your sources must be official space agencies (ISRO, NASA, ESA), astronomy magazines, or astrophysics preprints."
-    ),
-    "climate_change_environment": (
-        "Focus on ecology, climate change science, and environment policy. "
-        "Your sources must be trusted bodies (IPCC, UNEP), scientific journals, and environment ministries."
-    ),
-    "legal_constitution_policy": (
-        "Focus on public policy, judicial rulings, legal updates, and constitutional law. "
-        "Your sources must be official court portals, trusted legal digests, legislative updates, and think-tanks."
-    ),
-    "education_academia": (
-        "Focus on academic curriculum, educational technology, learning guides, and career counseling. "
-        "Your sources must be official academic regulators (Ministry of Education, UGC, AICTE), universities, or scholar search engines."
-    ),
-    "history_archaeology": (
-        "Focus on historical analysis, heritage sites, and archeological findings. "
-        "Your sources must be archaeological surveys, academic databases, history catalogs, and museums."
-    ),
-    "cryptocurrency_blockchain": (
-        "Focus on Web3 projects, blockchain protocols, and crypto market insights. "
-        "Your sources must be developer sites, cryptographic research, or leading crypto outlets."
-    ),
-    "business_management_entrepreneurship": (
-        "Focus on business strategy, entrepreneurship, and management principles. "
-        "Your sources must be major startup portals, business reviews (HBR), and entrepreneur guides."
-    ),
-    "cybersecurity_privacy": (
-        "Focus on cyber threats, security practices, privacy laws, and software vulnerabilities. "
-        "Your sources must be official response teams (CERT-In), security groups (SANS, OWASP), and trusted cybersecurity journals."
-    ),
-    "automobile_transport": (
-        "Focus on electric vehicles, automotive technology, and transit systems. "
-        "Your sources must be autotech journals, vehicle portals, and transport directories."
-    ),
-    "gadgets_consumer_electronics": (
-        "Focus on mobile reviews, home electronics, and consumer hardware news. "
-        "Your sources must be verified gadget databases, consumer tech magazines, and electronics guides."
-    ),
-    "agriculture_food_tech": (
-        "Focus on smart farming, crops, agrochemicals, and food science. "
-        "Your sources must be agricultural bodies (ICAR), food directories, and agriculture magazines."
-    ),
-    "sports_athletics": (
-        "Focus on cricket, athletics, and international sports tournaments. "
-        "Your sources must be sports news networks (Cricinfo, Sportstar, NDTV Sports) and official athletic boards."
-    ),
-    "entertainment_media_pop_culture": (
-        "Focus on movies, music, popular culture, and streaming platforms. "
-        "Your sources must be film reviews, major entertainment media outlets, and pop-culture portals."
-    ),
-    "travel_tourism_hospitality": (
-        "Focus on travel itineraries, destinations, cultural tourism, and hospitality trends. "
-        "Your sources must be tourism boards (Incredible India), verified travel guides, and travelers forums."
-    ),
-    "sociology_anthropology_social_issues": (
-        "Focus on public policy, social studies, demographics, and human rights. "
-        "Your sources must be international reports (UN, World Bank), think-tanks, and sociology journals."
-    ),
-}
+PROMPTS_DIR = config.PROJECT_ROOT / "prompts" / "research"
+
+# Below this many characters of *genuine* (non-error, non-empty) collected
+# evidence, we don't trust the LLM to write a substantive brief without
+# leaning on its own training data — so we flag the brief as thin/unverified
+# and let main.py decide whether to warn the user or halt the pipeline.
+MIN_EVIDENCE_CHARS = getattr(config, "MIN_EVIDENCE_CHARS", 400)
+
+
+@lru_cache(maxsize=None)
+def load_category_prompt(category: str) -> str:
+    """Load the full research-instructions prompt for a category from disk.
+
+    Falls back to the default category's file if the requested one is
+    missing, so a typo'd/unknown category never crashes the pipeline.
+    """
+    path = PROMPTS_DIR / f"{category}.md"
+    if not path.exists():
+        path = PROMPTS_DIR / f"{DEFAULT_CATEGORY}.md"
+    if not path.exists():
+        # Last-resort inline fallback if the prompts directory itself is missing.
+        return (
+            "Focus on the topic directly. Use ONLY the raw search evidence "
+            "provided below — never your own training knowledge. If evidence "
+            "is thin, say so explicitly instead of inventing details."
+        )
+    return path.read_text(encoding="utf-8")
+
+
+def _extract_directive_block(full_prompt: str) -> str:
+    """Pull out just the short 'category + focus + trusted domains' block
+    for use in the (shorter) planning prompt, so plan_node's context stays
+    small even though synthesize_node uses the full file.
+    """
+    match = re.search(
+        r"CRITICAL CATEGORY-SPECIFIC DIRECTIVE:(.*?)(?=\n=+\nCRITICAL GROUNDING)",
+        full_prompt,
+        re.DOTALL,
+    )
+    if match:
+        return "CRITICAL CATEGORY-SPECIFIC DIRECTIVE:" + match.group(1).strip()
+    return full_prompt[:600]
+
 
 CATEGORIZATION_PROMPT_TEMPLATE = (
     "You are an expert content classifier. Given a blog topic, "
@@ -159,6 +158,9 @@ CATEGORIZATION_PROMPT_TEMPLATE = (
     "19. entertainment_media_pop_culture\n"
     "20. travel_tourism_hospitality\n"
     "21. sociology_anthropology_social_issues\n\n"
+    "If the topic is a specific local/regional news event (a crime, accident, "
+    "incident, or human-interest story tied to a place), classify it as "
+    "'national_news_politics' unless it clearly fits a more specific category above.\n\n"
     "Topic: {topic}\n\n"
     "Response (category code name only):"
 )
@@ -171,7 +173,7 @@ def categorize_topic(llm: BaseChatModel, topic: str) -> str:
         response = llm.invoke(prompt)
         content = response.content if hasattr(response, "content") else str(response)
         content = content.strip().lower().replace("'", "").replace('"', "")
-        for cat in CATEGORY_INSTRUCTIONS.keys():
+        for cat in CATEGORY_KEYS:
             if cat in content:
                 return cat
     except Exception as e:
@@ -208,14 +210,46 @@ def _safe_json_loads(text: str, default: Any) -> Any:
 
 VALID_TOOLS = {
     "tavily_news", "tavily_deep", "serper_recent", "serper_deep",
+    "exa_recent", "exa_deep", "linkup_recent", "linkup_deep",
     "wikipedia", "ddg_recent", "ddg_deep", "arxiv",
 }
+
+# DuckDuckGo is a fallback of last resort — never advertised to the planner
+# LLM as a primary option when a stronger engine is configured.
+_DDG_RECENT_PRIMARIES = ("tavily_news", "serper_recent", "exa_recent", "linkup_recent")
+_DDG_DEEP_PRIMARIES = ("tavily_deep", "serper_deep", "exa_deep", "linkup_deep", "wikipedia")
+
+# Regex to pull "[Title](URL)" markdown links out of the synthesized brief,
+# so the Sources section can render real titles instead of bare URLs.
+_MD_LINK_RE = re.compile(r"\[([^\[\]]{1,200}?)\]\((https?://[^\s)]+)\)")
+_BARE_URL_RE = re.compile(r"https?://[^\s)\]\}<>]+")
+
+# Substrings that mark a search result as a failure / non-answer rather than
+# genuine evidence, so they don't count toward the "do we have enough real
+# evidence" check and don't get treated as citable content.
+_FAILURE_MARKERS = (
+    "[tool error",
+    "search failed",
+    "search unavailable",
+    "[error:",
+)
+
+
+def _is_genuine_evidence(content: str) -> bool:
+    if not content or not content.strip():
+        return False
+    lowered = content.lower()
+    return not any(marker in lowered for marker in _FAILURE_MARKERS)
 
 
 def _coerce_queries(raw: Any, available: set[str], fallback_recent: str, fallback_deep: str) -> list[PlannedQuery]:
     """Turn loosely-parsed JSON into a validated list of PlannedQuery, remapping
     any tool name that isn't actually available (e.g. no TAVILY_API_KEY) to a
     working substitute so the plan never silently produces zero queries.
+
+    Also demotes ddg_recent/ddg_deep back to a stronger primary tool
+    whenever one is actually available — DuckDuckGo is fallback-of-last-
+    resort only, even if the planner LLM picked it directly.
     """
     items = raw if isinstance(raw, list) else raw.get("queries", []) if isinstance(raw, dict) else []
     out: list[PlannedQuery] = []
@@ -229,8 +263,14 @@ def _coerce_queries(raw: Any, available: set[str], fallback_recent: str, fallbac
         if tool not in VALID_TOOLS:
             tool = fallback_deep
         if tool not in available:
-            is_recency = tool in ("tavily_news", "serper_recent", "ddg_recent")
+            is_recency = tool in ("tavily_news", "serper_recent", "exa_recent", "linkup_recent", "ddg_recent")
             tool = fallback_recent if is_recency else fallback_deep
+        # DDG is a last resort: swap it out for a stronger primary tool if
+        # one is configured, regardless of what the planner chose.
+        if tool == "ddg_recent" and any(p in available for p in _DDG_RECENT_PRIMARIES):
+            tool = fallback_recent
+        elif tool == "ddg_deep" and any(p in available for p in _DDG_DEEP_PRIMARIES):
+            tool = fallback_deep
         if tool not in available:
             continue
         out.append(PlannedQuery(tool=tool, query=query, reason=str(item.get("reason", ""))[:200]))
@@ -243,10 +283,18 @@ def build_research_agent(llm: BaseChatModel, category: str = DEFAULT_CATEGORY) -
     available = set(toolkit.keys())
 
     # Sensible fallbacks if the ideal tool isn't configured (no API key).
-    fallback_recent = next((t for t in ("tavily_news", "serper_recent", "ddg_recent") if t in available), "ddg_recent")
-    fallback_deep = next((t for t in ("tavily_deep", "serper_deep", "wikipedia", "ddg_deep") if t in available), "wikipedia")
+    # DuckDuckGo is deliberately last in both lists -- fallback of last resort.
+    fallback_recent = next(
+        (t for t in ("tavily_news", "serper_recent", "exa_recent", "linkup_recent", "ddg_recent") if t in available),
+        "ddg_recent",
+    )
+    fallback_deep = next(
+        (t for t in ("tavily_deep", "serper_deep", "exa_deep", "linkup_deep", "wikipedia", "ddg_deep") if t in available),
+        "wikipedia",
+    )
 
-    category_instructions = CATEGORY_INSTRUCTIONS.get(category, CATEGORY_INSTRUCTIONS[DEFAULT_CATEGORY])
+    full_category_prompt = load_category_prompt(category)
+    category_directive = _extract_directive_block(full_category_prompt)
 
     # --- Node: plan ---------------------------------------------------------
     def plan_node(state: ResearchState) -> dict:
@@ -254,9 +302,18 @@ def build_research_agent(llm: BaseChatModel, category: str = DEFAULT_CATEGORY) -
         topic = state["topic"]
         today_human = state["today_human"]
 
+        # DuckDuckGo is fallback-of-last-resort: hide it from the planner's
+        # menu entirely unless it's the only tool available for that role,
+        # so the LLM doesn't reach for it as a primary choice.
+        planning_available = set(available)
+        if any(p in available for p in _DDG_RECENT_PRIMARIES):
+            planning_available.discard("ddg_recent")
+        if any(p in available for p in _DDG_DEEP_PRIMARIES):
+            planning_available.discard("ddg_deep")
+
         if iteration == 0:
             gap_note = ""
-            n_queries = "3-5"
+            n_queries = "6-8"
         else:
             missing = state.get("missing_aspects", [])
             gap_note = (
@@ -266,23 +323,26 @@ def build_research_agent(llm: BaseChatModel, category: str = DEFAULT_CATEGORY) -
                 + "\nYour queries must target ONLY closing these gaps — do not "
                 "re-research things already covered.\n\n"
             )
-            n_queries = "2-3"
+            n_queries = "3-4"
 
         prompt = f"""Today's date is {today_human}. You are planning search queries for a research brief on the topic: "{topic}".
 
-{category_instructions}
+{category_directive}
 
-{gap_note}Available tools (use ONLY these exact names): {sorted(available)}
-  - tavily_news / serper_recent / ddg_recent = restricted to the last {config.NEWS_RECENCY_DAYS} days. Use for anything time-sensitive.
-  - tavily_deep / serper_deep / ddg_deep / wikipedia = unrestricted background/definitional search.
+{gap_note}Available tools (use ONLY these exact names): {sorted(planning_available)}
+  - tavily_news / serper_recent / exa_recent / linkup_recent = restricted to the last {config.NEWS_RECENCY_DAYS} days. Use for anything time-sensitive.
+  - tavily_deep / serper_deep / exa_deep / linkup_deep / wikipedia = unrestricted background/definitional search.
   - arxiv = academic preprints (only if the topic is scientific/technical).
+  - ddg_recent / ddg_deep, if listed, are a FALLBACK OF LAST RESORT — only use them if nothing else in the list above covers that role.
 
 Generate a JSON array of {n_queries} search queries. Each item must be:
 {{"tool": "<one of the available tool names above>", "query": "<search string>", "reason": "<short phrase>"}}
 
 Rules:
+- Spread queries across DIFFERENT tools (don't send every query to the same engine) — the goal is at least {config.MIN_SOURCES_TARGET} distinct, real source URLs collected across this iteration, and different engines surface different sources.
 - At least one query MUST explicitly target the most recent news/developments — phrase it with words like "latest", "{today_human.split()[-1]}", or a specific recent month/year, and use a recency-restricted tool.
 - Unless this is a follow-up round, include at least one background/definition query using an unrestricted tool.
+- For a specific named person/place/incident, include the exact name/place as a standalone query too (not only broad category terms) — specific queries surface the real event, broad ones surface generic background instead.
 - Do not duplicate query text across tools.
 - Return ONLY the raw JSON array — no prose, no markdown code fences.
 """
@@ -299,8 +359,8 @@ Rules:
         if not queries:
             # Guaranteed minimal plan so the graph always makes forward progress.
             queries = [
-                PlannedQuery(tool=fallback_recent, query=f"latest {topic} news {today_human}", reason="fallback recency query"),
-                PlannedQuery(tool=fallback_deep, query=f"{topic} overview", reason="fallback background query"),
+                PlannedQuery(tool=fallback_recent, query=f"{topic} latest news {today_human}", reason="fallback recency query"),
+                PlannedQuery(tool=fallback_deep, query=f"{topic}", reason="fallback background query"),
             ]
 
         for q in queries:
@@ -345,6 +405,10 @@ Rules:
         today_human = state["today_human"]
         collected = state.get("collected", [])
 
+        genuine_records = [rec for rec in collected if _is_genuine_evidence(rec.get("content", ""))]
+        genuine_chars = sum(len(rec["content"]) for rec in genuine_records)
+        evidence_insufficient = genuine_chars < MIN_EVIDENCE_CHARS
+
         evidence_blocks = []
         for rec in collected:
             evidence_blocks.append(
@@ -352,41 +416,48 @@ Rules:
             )
         evidence_text = "\n\n".join(evidence_blocks) if evidence_blocks else "(no search results collected)"
 
+        thin_evidence_note = ""
+        if evidence_insufficient:
+            thin_evidence_note = (
+                "\nNOTE: The raw evidence collected below is thin or largely empty "
+                "(only "
+                f"{genuine_chars} characters of genuine search content). This strongly "
+                "suggests the search tools could not find substantive coverage of this "
+                "exact topic. In this case you MUST NOT fill the gap with your own "
+                "background knowledge. Write a short brief that honestly states what "
+                "little (if anything) was found, and say explicitly that verified "
+                "recent information could not be located — do not pad it out.\n"
+            )
+
+        distinct_urls = len({u for rec in genuine_records for u in _BARE_URL_RE.findall(rec["content"])})
+        source_count_note = (
+            f"\nCITATION BREADTH REQUIREMENT: The evidence collected this run contains "
+            f"roughly {distinct_urls} distinct source URLs. Cite AT LEAST "
+            f"{min(config.MIN_SOURCES_TARGET, distinct_urls)} of the distinct, genuinely "
+            "different sources present in the evidence above — not just the first two or "
+            "three. Every time you use a fact from a source, write it as a proper "
+            "markdown link using that source's real title from its 'Title:' line where "
+            "one is given (e.g. '[Reuters: India GDP grows 7%](https://reuters.com/...)'), "
+            "falling back to the domain name as the title only if no title was given. Do "
+            "NOT cite the same one or two sources for the whole brief while ignoring the "
+            "rest of the evidence — spread citations across as many of the distinct "
+            "sources collected as actually contain relevant, usable information.\n"
+        )
+
+        # Full per-category instructions (focus, trusted domains, structure,
+        # and — critically — the anti-hallucination / grounding rules) come
+        # straight from the prompts/research/<category>.md file.
         prompt = f"""Today's date is {today_human}. You are compiling a research brief on: "{topic}".
 
-{category_instructions}
-
-Below are raw search results gathered from multiple tools/queries. Synthesize
-them into ONE consolidated, well-organized research brief. CRITICAL:
-- Explicitly call out dates whenever a source result mentions one (e.g. "on
-  3 July 2026, ..."). Never blur a dated fact into a vague "recently".
-- Preserve every concrete statistic, name, and specific example you find.
-- Keep the source URL next to each fact you cite from it.
-- If the evidence contains conflicting recent claims, note the discrepancy
-  rather than silently picking one.
-- Do not invent facts not present in the evidence below.
-
-Raw evidence:
+{full_category_prompt}
+{thin_evidence_note}
+{source_count_note}
+Raw evidence collected this run (this is the ONLY information you may use):
 {evidence_text}
 
-Write the brief in exactly this structure:
-
-## Definition
-(short paragraph)
-
-## Key subtopics
-- Subtopic A — one-line description
-- Subtopic B — one-line description
-
-## Recent developments / examples (as of {today_human})
-- Dated fact or example, with source URL in parentheses
-- ...
-
-## Notable sources
-- URL 1
-- URL 2
-
-Only include the brief itself — no preamble, no meta-commentary.
+Write the brief now, following the OUTPUT FORMAT given above exactly, with
+{{today_human}} replaced by {today_human}. Only include the brief itself —
+no preamble, no meta-commentary.
 """
         try:
             response = llm.invoke(prompt)
@@ -395,13 +466,34 @@ Only include the brief itself — no preamble, no meta-commentary.
             print(f"  - [warning] Synthesis failed: {e}", flush=True)
             brief = evidence_text
 
-        return {"brief": brief}
+        if evidence_insufficient:
+            print(
+                f"  - [synthesize] [warning] Evidence is thin ({genuine_chars} genuine "
+                "chars) — brief flagged as evidence_insufficient.",
+                flush=True,
+            )
+
+        return {"brief": brief, "evidence_insufficient": evidence_insufficient}
 
     # --- Node: reflect ---------------------------------------------------------
     def reflect_node(state: ResearchState) -> dict:
         iteration = state.get("iteration", 0) + 1
         today_human = state["today_human"]
         brief = state.get("brief", "")
+        collected = state.get("collected", [])
+
+        # How many distinct sources does the brief actually cite, vs. how
+        # many distinct sources are even available in the raw evidence
+        # collected so far? We only ask for more if there's real headroom.
+        cited_urls = {url for _, url in _MD_LINK_RE.findall(brief)} | set(_BARE_URL_RE.findall(brief))
+        available_urls = {
+            u
+            for rec in collected
+            if _is_genuine_evidence(rec.get("content", ""))
+            for u in _BARE_URL_RE.findall(rec["content"])
+        }
+        source_target = min(config.MIN_SOURCES_TARGET, len(available_urls)) if available_urls else 0
+        source_count_ok = len(cited_urls) >= source_target
 
         prompt = f"""Today's date is {today_human}. Review this research brief:
 
@@ -410,8 +502,12 @@ Only include the brief itself — no preamble, no meta-commentary.
 ---
 
 Does the "Recent developments" section contain SPECIFIC, DATED facts or
-events from roughly the last {config.NEWS_RECENCY_DAYS}-{config.NEWS_RECENCY_DAYS * 2} days, each with a source URL?
-(Generic, undated statements like "the situation continues to evolve" do NOT count.)
+events from roughly the last {config.NEWS_RECENCY_DAYS}-{config.NEWS_RECENCY_DAYS * 2} days, each with a source URL that appears verbatim in the brief?
+(Generic, undated statements like "the situation continues to evolve", or an
+explicit "no verified recent developments were found" statement, do NOT count
+as satisfied — but if the brief HONESTLY says nothing recent was found, do not
+ask for follow-up queries that were already tried; instead accept the honest
+gap unless there are genuinely untried angles.)
 
 Return ONLY a JSON object, no prose:
 {{"has_recent_dated_facts": true or false, "missing_aspects": ["short phrase", ...], "follow_up_queries": []}}
@@ -431,12 +527,30 @@ missing_aspects should be empty if has_recent_dated_facts is true.
         if not isinstance(missing, list):
             missing = [str(missing)]
 
-        print(f"  - [reflect] iteration={iteration} has_recent_dated_facts={has_recent} missing={missing}", flush=True)
+        if not source_count_ok:
+            missing = missing + [
+                f"Not enough distinct sources cited ({len(cited_urls)}/{source_target} target) — "
+                "cite more of the distinct sources already present in the collected evidence, "
+                "and/or search for additional angles with different tools to surface new sources."
+            ]
 
-        return {"iteration": iteration, "has_recent_dated_facts": has_recent, "missing_aspects": missing}
+        print(
+            f"  - [reflect] iteration={iteration} has_recent_dated_facts={has_recent} "
+            f"cited_sources={len(cited_urls)}/{source_target} missing={missing}",
+            flush=True,
+        )
+
+        return {
+            "iteration": iteration,
+            "has_recent_dated_facts": has_recent,
+            "missing_aspects": missing,
+            "source_count_ok": source_count_ok,
+        }
 
     def route_after_reflect(state: ResearchState) -> str:
-        if state.get("has_recent_dated_facts", True):
+        recent_ok = state.get("has_recent_dated_facts", True)
+        sources_ok = state.get("source_count_ok", True)
+        if recent_ok and sources_ok:
             return "end"
         if state.get("iteration", 0) >= state.get("max_iterations", config.DEEP_RESEARCH_MAX_ITERATIONS):
             print("  - [reflect] max iterations reached, finalizing with best available brief.", flush=True)
@@ -444,23 +558,103 @@ missing_aspects should be empty if has_recent_dated_facts is true.
         return "continue"
 
     # --- Node: finalize ---------------------------------------------------------
+    def _title_from_raw_evidence(url: str, collected: list) -> str:
+        """Best-effort title lookup for a bare URL from the 'Title: ...'
+        lines the exa/linkup tools emit next to each result's URL."""
+        for rec in collected:
+            content = rec.get("content", "")
+            if url not in content:
+                continue
+            for block in content.split("\n\n"):
+                if url in block:
+                    m = re.search(r"^Title:\s*(.+)$", block, re.MULTILINE)
+                    if m:
+                        return m.group(1).strip()
+        return ""
+
     def finalize_node(state: ResearchState) -> dict:
         brief = state.get("brief", "")
         today_human = state["today_human"]
+        collected = state.get("collected", [])
 
-        urls = re.findall(r"https?://[^\s)\]\}<>]+", brief)
-        cleaned: list[str] = []
+        # --- 1. Titled sources actually cited as markdown links in the brief.
+        sources: list[dict] = []
         seen: set[str] = set()
-        for u in urls:
-            u = u.rstrip(".,;:!?")
+        for title, url in _MD_LINK_RE.findall(brief):
+            u = url.rstrip(".,;:!?")
             if u not in seen:
                 seen.add(u)
-                cleaned.append(u)
+                sources.append({"title": title.strip(), "url": u})
+
+        # --- 2. Any remaining bare URLs mentioned in the brief but not
+        # already wrapped in a markdown link — give them a best-effort
+        # title from the raw evidence, falling back to the domain name.
+        for u in _BARE_URL_RE.findall(brief):
+            u = u.rstrip(".,;:!?")
+            if u in seen:
+                continue
+            seen.add(u)
+            title = _title_from_raw_evidence(u, collected)
+            if not title:
+                from urllib.parse import urlparse
+
+                title = urlparse(u).netloc or u
+            sources.append({"title": title, "url": u})
+
+        # --- 3. Pad up to MIN_SOURCES_TARGET from raw collected evidence
+        # (genuine, non-error results only) whenever the brief itself
+        # under-cites relative to what was actually collected this run.
+        # Two passes: first the structured "Title: ... / URL: ..." blocks
+        # that exa/linkup emit (best titles), then any remaining bare URLs
+        # from tools with unstructured output (tavily/serper/wikipedia/ddg),
+        # using the domain name as the title.
+        if len(sources) < config.MIN_SOURCES_TARGET:
+            for rec in collected:
+                content = rec.get("content", "")
+                if not _is_genuine_evidence(content):
+                    continue
+                for block in content.split("\n\n"):
+                    if len(sources) >= config.MIN_SOURCES_TARGET:
+                        break
+                    url_match = re.search(r"URL:\s*(https?://\S+)", block)
+                    if not url_match:
+                        continue
+                    u = url_match.group(1).rstrip(".,;:!?")
+                    if u in seen:
+                        continue
+                    seen.add(u)
+                    title_match = re.search(r"^Title:\s*(.+)$", block, re.MULTILINE)
+                    title = title_match.group(1).strip() if title_match else u
+                    sources.append({"title": title, "url": u})
+                if len(sources) >= config.MIN_SOURCES_TARGET:
+                    break
+
+            if len(sources) < config.MIN_SOURCES_TARGET:
+                from urllib.parse import urlparse
+
+                for rec in collected:
+                    content = rec.get("content", "")
+                    if not _is_genuine_evidence(content):
+                        continue
+                    for u in _BARE_URL_RE.findall(content):
+                        if len(sources) >= config.MIN_SOURCES_TARGET:
+                            break
+                        u = u.rstrip(".,;:!?")
+                        if u in seen:
+                            continue
+                        seen.add(u)
+                        sources.append({"title": urlparse(u).netloc or u, "url": u})
+                    if len(sources) >= config.MIN_SOURCES_TARGET:
+                        break
+
+        source_urls = [s["url"] for s in sources]
 
         header = f"_Research compiled on {today_human}. Recency window: last {config.NEWS_RECENCY_DAYS} days for news._\n\n"
         final_brief = header + brief.strip()
 
-        return {"brief": final_brief, "source_urls": cleaned}
+        print(f"  - [finalize] {len(sources)} distinct source(s) collected for citation.", flush=True)
+
+        return {"brief": final_brief, "source_urls": source_urls, "sources": sources}
 
     graph = StateGraph(ResearchState)
     graph.add_node("plan", plan_node)
@@ -479,8 +673,15 @@ missing_aspects should be empty if has_recent_dated_facts is true.
     return graph.compile()
 
 
-def run_research(agent: Any, topic: str) -> str:
-    """Run the deep-research graph and return the consolidated research brief text."""
+def run_research(agent: Any, topic: str) -> dict:
+    """Run the deep-research graph and return the full final state dict.
+
+    Callers should read at least ``brief`` and ``evidence_insufficient`` —
+    the latter is True when the search tools couldn't find substantive
+    coverage of the topic, which callers should treat as a strong signal to
+    warn the user (or abort) rather than silently generating a post that
+    may lean on the LLM's own (possibly stale or wrong) background knowledge.
+    """
     print("  - Starting deep research graph...", flush=True)
 
     initial_state: ResearchState = {
@@ -494,10 +695,13 @@ def run_research(agent: Any, topic: str) -> str:
         "brief": "",
         "has_recent_dated_facts": False,
         "missing_aspects": [],
+        "source_count_ok": False,
         "source_urls": [],
+        "sources": [],
+        "evidence_insufficient": False,
     }
 
-    final_state: dict = {}
+    final_state: dict = dict(initial_state)
     try:
         for step in agent.stream(initial_state, config={"recursion_limit": 50}):
             for node_name, node_state in step.items():
@@ -506,7 +710,7 @@ def run_research(agent: Any, topic: str) -> str:
     except Exception as e:
         print(f"  - [warning] Research graph error: {e}", flush=True)
 
-    return final_state.get("brief", "")
+    return final_state
 
 
 def get_source_urls(agent_result_brief: str) -> list[str]:
@@ -522,4 +726,12 @@ def get_source_urls(agent_result_brief: str) -> list[str]:
     return cleaned
 
 
-__all__ = ["build_research_agent", "run_research", "categorize_topic", "get_source_urls"]
+__all__ = [
+    "build_research_agent",
+    "run_research",
+    "categorize_topic",
+    "get_source_urls",
+    "load_category_prompt",
+    "CATEGORY_KEYS",
+    "DEFAULT_CATEGORY",
+]

@@ -62,6 +62,15 @@ PLANNER_TEMPERATURE = float(os.getenv("PLANNER_TEMPERATURE", "0.1"))
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 TAVILY_MAX_RESULTS = int(os.getenv("TAVILY_MAX_RESULTS", "5"))
 SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")
+# Exa — neural/semantic search API that also returns full page contents per
+# result (not just snippets), which is why it's prioritized alongside
+# Tavily/Serper. Get a key at https://exa.ai
+EXA_API_KEY = os.getenv("EXA_API_KEY", "")
+EXA_MAX_RESULTS = int(os.getenv("EXA_MAX_RESULTS", "8"))
+# Linkup — web search API with strong recency/source coverage. Get a key at
+# https://linkup.so
+LINKUP_API_KEY = os.getenv("LINKUP_API_KEY", "")
+LINKUP_MAX_RESULTS = int(os.getenv("LINKUP_MAX_RESULTS", "8"))
 
 # ---------------------------------------------------------------------------
 # Deep-research / recency settings
@@ -74,9 +83,21 @@ BACKGROUND_RECENCY_DAYS = int(os.getenv("BACKGROUND_RECENCY_DAYS", "365"))
 # Max number of plan -> search -> reflect loops in the deep research graph.
 DEEP_RESEARCH_MAX_ITERATIONS = int(os.getenv("DEEP_RESEARCH_MAX_ITERATIONS", "3"))
 # Max number of queries planned per iteration (across all tools).
-MAX_QUERIES_PER_ITERATION = int(os.getenv("MAX_QUERIES_PER_ITERATION", "5"))
+MAX_QUERIES_PER_ITERATION = int(os.getenv("MAX_QUERIES_PER_ITERATION", "8"))
 # Max parallel tool calls executed concurrently within a single iteration.
-MAX_PARALLEL_SEARCHES = int(os.getenv("MAX_PARALLEL_SEARCHES", "5"))
+MAX_PARALLEL_SEARCHES = int(os.getenv("MAX_PARALLEL_SEARCHES", "8"))
+# Minimum characters of *genuine* (non-error) collected search evidence
+# before the research graph trusts the brief to be well-grounded. Below
+# this, the brief is flagged `evidence_insufficient` so main.py can warn
+# the user instead of silently publishing a post that may be leaning on
+# the LLM's own background knowledge rather than real search results.
+MIN_EVIDENCE_CHARS = int(os.getenv("MIN_EVIDENCE_CHARS", "400"))
+# Minimum number of *distinct* cited sources the finished post should have.
+# The synthesize/reflect steps in the research graph use this as a target
+# to keep looping / widening queries toward, and the finalize step pads the
+# structured source list (title + url) up to this count from raw collected
+# evidence whenever the LLM-written brief under-cites.
+MIN_SOURCES_TARGET = int(os.getenv("MIN_SOURCES_TARGET", "10"))
 
 # ---------------------------------------------------------------------------
 # Image APIs — priority order: Serper/Tavily (web) → Unsplash → Pexels → Pixabay
@@ -93,8 +114,14 @@ IMAGE_MIN_HEIGHT = int(os.getenv("IMAGE_MIN_HEIGHT", "600"))
 ENABLE_ARXIV = os.getenv("ENABLE_ARXIV", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
-# Memory settings (Mem0 / Chroma)
+# Memory (Mem0 / Chroma) — DISABLED.
 # ---------------------------------------------------------------------------
+# The pipeline no longer recalls or records posts via Mem0. Mem0's semantic
+# recall was pulling in stale/old content and biasing new generations toward
+# previously-written (and potentially outdated) material — the opposite of
+# what a "must be current as of today" pipeline needs. memory/mem0_store.py
+# is kept in the repo for reference / future reintroduction, but main.py no
+# longer imports or calls it.
 MEM0_USER_ID = os.getenv("MEM0_USER_ID", "blog-agent")
 
 
@@ -122,6 +149,17 @@ def validate() -> list[str]:
     elif not SERPER_API_KEY:
         issues.append(
             "SERPER_API_KEY is not set — Google Serper search tool will be unavailable."
+        )
+    if not EXA_API_KEY:
+        issues.append(
+            "EXA_API_KEY is not set — Exa search (full-content neural search) will be "
+            "unavailable, which will make it harder to reach the "
+            f"{MIN_SOURCES_TARGET}-source target."
+        )
+    if not LINKUP_API_KEY:
+        issues.append(
+            "LINKUP_API_KEY is not set — Linkup search will be unavailable, which will "
+            f"make it harder to reach the {MIN_SOURCES_TARGET}-source target."
         )
     if not (UNSPLASH_ACCESS_KEY or PEXELS_API_KEY or PIXABAY_API_KEY):
         issues.append(
@@ -153,11 +191,17 @@ __all__ = [
     "TAVILY_API_KEY",
     "TAVILY_MAX_RESULTS",
     "SERPER_API_KEY",
+    "EXA_API_KEY",
+    "EXA_MAX_RESULTS",
+    "LINKUP_API_KEY",
+    "LINKUP_MAX_RESULTS",
     "NEWS_RECENCY_DAYS",
     "BACKGROUND_RECENCY_DAYS",
     "DEEP_RESEARCH_MAX_ITERATIONS",
     "MAX_QUERIES_PER_ITERATION",
     "MAX_PARALLEL_SEARCHES",
+    "MIN_EVIDENCE_CHARS",
+    "MIN_SOURCES_TARGET",
     "UNSPLASH_ACCESS_KEY",
     "PEXELS_API_KEY",
     "PIXABAY_API_KEY",
