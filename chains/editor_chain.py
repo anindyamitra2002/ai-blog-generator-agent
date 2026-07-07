@@ -11,16 +11,20 @@ from __future__ import annotations
 from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
 
+import config
 
 EDITOR_INSTRUCTIONS = """You are a senior editor. Polish a complete draft blog post.
 
+Today's date is {today_human}. This post is being published today, so the intro must situate the reader in the present moment — reference "as of {today_human}" or the current month/year naturally where it fits, rather than reading like a timeless evergreen piece.
+
 CRITICAL INSTRUCTIONS FOR DETAIL PRESERVATION:
 - Your primary duty is to preserve every single concrete fact, statistic, percentage, date, metric, name, and source citation/URL present in the draft.
-- Do NOT delete, generalize, or smooth out specific numbers, names, or reference links.
+- Do NOT delete, generalize, or smooth out specific numbers, names, dates, or reference links.
 - Keep all inline citations (such as '[Source Name](URL)') intact. Do not remove markdown links.
+- Never replace a specific date already present in the draft with a vague word like "recently."
 
 Your job:
-1. Add a strong introductory paragraph (2-4 sentences) at the very top, before the first section heading, that hooks the reader and previews the key facts and insights the post covers.
+1. Add a strong introductory paragraph (2-4 sentences) at the very top, before the first section heading, that hooks the reader, previews the key facts and insights the post covers, and grounds the reader in the current timeframe ({today_human}).
 2. Add a concluding paragraph at the very end under a `## Conclusion` heading that synthesizes the key findings and source takeaways — do not just restate the intro.
 3. Smooth the transitions between sections so the post reads as one continuous piece, not a list of standalone chunks, while retaining all details.
 4. Fix any awkward phrasing, grammatical issues, or redundancy.
@@ -54,7 +58,7 @@ def build_editor_chain(llm: BaseChatModel):
             ("system", EDITOR_INSTRUCTIONS),
             ("human", "Title: {title}\n\nDraft:\n{draft}\n\nReturn the polished post."),
         ]
-    )
+    ).partial(today_human=config.TODAY_HUMAN)
     return prompt | llm
 
 

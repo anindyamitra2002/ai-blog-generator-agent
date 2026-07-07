@@ -1,28 +1,50 @@
-"""Build the tool-calling research agent.
+"""Deep-research LangGraph agent.
 
-The research phase is the only agentic stage in the pipeline — the model
-decides which research tools to call and in what order, since research
-needs vary by topic type. Everything downstream of research (outlining,
-writing, editing) is a deterministic, fixed sequence.
+Unlike a single-shot ``create_react_agent`` tool loop, this is an explicit
+LangGraph ``StateGraph`` with four stages that repeat until the brief is
+actually grounded in dated, recent information:
 
-This module uses ``langgraph.prebuilt.create_react_agent``, which is the
-canonical agent API in LangChain 1.0+. The older ``AgentExecutor`` /
-``create_tool_calling_agent`` imports from ``langchain.agents`` were
-removed in LangChain 1.0 in favor of the LangGraph-based runtime.
+    plan -> search -> synthesize -> reflect --(gap found)--> plan (loop)
+                                          \\--(no gap / out of budget)--> finalize -> END
+
+* ``plan``       — LLM proposes 3-5 search queries for this iteration,
+                    always anchored to today's real date, and always
+                    including at least one explicitly "recent news" query.
+* ``search``     — the planned queries are executed *deterministically*
+                    (no further LLM tool-choice ambiguity) against the
+                    matching search tool, in parallel.
+* ``synthesize`` — LLM turns all collected search snippets into a single
+                    structured research brief, instructed to keep every
+                    date/statistic/URL it finds.
+* ``reflect``    — LLM checks its own brief: does it actually contain
+                    dated, recent (last N days) facts with sources? If
+                    not, it proposes follow-up queries and the graph loops
+                    back to ``plan`` (bounded by DEEP_RESEARCH_MAX_ITERATIONS).
+* ``finalize``   — stamps the brief with the generation date and extracts
+                    the final source-URL list.
+
+This gives genuinely agentic, iterative "deep search" behavior instead of a
+fixed 1-2-tool-call ceiling, while keeping each individual tool call
+deterministic and cheap.
 """
 
 from __future__ import annotations
 
+import json
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
-from pathlib import Path
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage
-from langgraph.prebuilt import create_react_agent
+from langgraph.graph import END, StateGraph
 
-from tools.search_tools import build_search_tools
+import config
+from schemas import PlannedQuery
+from tools.search_tools import build_search_toolkit
 
+from .state import ResearchState
 
+DEFAULT_CATEGORY = "geopolitics_international_relations"
 
 CATEGORY_INSTRUCTIONS = {
     "geopolitics_international_relations": (
@@ -111,171 +133,393 @@ CATEGORY_INSTRUCTIONS = {
     ),
 }
 
-RESEARCH_SYSTEM_PROMPT = """You are the research sub-agent of a blog-writing pipeline.
-
-Your job: gather enough high-quality, sourced material on the user's topic \
-so that downstream stages (outlining, writing, editing) can produce a \
-well-grounded blog post.
-
-CRITICAL CATEGORY-SPECIFIC DIRECTIVE:
-{category_instructions}
-Ensure that all search queries and facts you extract strictly prioritize these specified sources and domains to keep the post unbiased and authoritative.
-
-A complete research pass should cover, where applicable:
-1. A clear definition of the topic — what it is, why it matters.
-2. Key subtopics or component concepts a reader needs to understand.
-3. Recent developments, news, or notable examples from trusted sources.
-4. At least 3-5 sourced facts, statistics, or specific examples with URLs from the specified domains.
-5. Common misconceptions or contrasting viewpoints, if relevant.
-
-You have access to several research tools (Tavily, Wikipedia, DuckDuckGo, \
-Google Serper, and optionally Arxiv). Decide for yourself which tool(s) to call and in \
-what order based on the topic. Different topics warrant different research \
-sequences — do not call every tool mechanically, and do not call the same \
-tool repeatedly with the same query.
-
-CRITICAL EFFICIENCY GUIDELINES:
-- Since you are running on a local CPU model, you must prioritize speed and conciseness.
-- Do NOT make more than 2 tool calls in total. Usually, 1 Wikipedia query and 1 Tavily/DuckDuckGo/Serper Search query are more than enough.
-- Do not search repeatedly. Once you have basic definitions and 2-3 links, proceed immediately to synthesize the research brief.
-
-When you have enough material, write a single consolidated research brief \
-with the following structure:
-
-  ## Definition
-  (short paragraph)
-
-  ## Key subtopics
-  - Subtopic A — one-line description
-  - Subtopic B — one-line description
-  - ...
-
-  ## Recent developments / examples
-  - Fact or example, with source URL in parentheses
-  - ...
-
-  ## Notable sources
-  - URL 1
-  - URL 2
-  - ...
-
-Do not write the blog post itself — only the research brief. End with the \
-list of source URLs you cited.
-"""
+CATEGORIZATION_PROMPT_TEMPLATE = (
+    "You are an expert content classifier. Given a blog topic, "
+    "classify it into exactly one of the following 21 categories. Return only the "
+    "exact category code name (e.g. 'artificial_intelligence_ml') and nothing else.\n\n"
+    "Categories:\n"
+    "1. geopolitics_international_relations\n"
+    "2. national_news_politics\n"
+    "3. artificial_intelligence_ml\n"
+    "4. software_development_programming\n"
+    "5. finance_investing_economics\n"
+    "6. health_medicine_healthcare\n"
+    "7. space_exploration_astronomy\n"
+    "8. climate_change_environment\n"
+    "9. legal_constitution_policy\n"
+    "10. education_academia\n"
+    "11. history_archaeology\n"
+    "12. cryptocurrency_blockchain\n"
+    "13. business_management_entrepreneurship\n"
+    "14. cybersecurity_privacy\n"
+    "15. automobile_transport\n"
+    "16. gadgets_consumer_electronics\n"
+    "17. agriculture_food_tech\n"
+    "18. sports_athletics\n"
+    "19. entertainment_media_pop_culture\n"
+    "20. travel_tourism_hospitality\n"
+    "21. sociology_anthropology_social_issues\n\n"
+    "Topic: {topic}\n\n"
+    "Response (category code name only):"
+)
 
 
 def categorize_topic(llm: BaseChatModel, topic: str) -> str:
     """Categorize the topic into one of the 21 categories."""
-    prompt = (
-        "You are an expert content classifier. Given a blog topic, "
-        "classify it into exactly one of the following 21 categories. Return only the "
-        "exact category code name (e.g. 'artificial_intelligence_ml') and nothing else.\n\n"
-        "Categories:\n"
-        "1. geopolitics_international_relations\n"
-        "2. national_news_politics\n"
-        "3. artificial_intelligence_ml\n"
-        "4. software_development_programming\n"
-        "5. finance_investing_economics\n"
-        "6. health_medicine_healthcare\n"
-        "7. space_exploration_astronomy\n"
-        "8. climate_change_environment\n"
-        "9. legal_constitution_policy\n"
-        "10. education_academia\n"
-        "11. history_archaeology\n"
-        "12. cryptocurrency_blockchain\n"
-        "13. business_management_entrepreneurship\n"
-        "14. cybersecurity_privacy\n"
-        "15. automobile_transport\n"
-        "16. gadgets_consumer_electronics\n"
-        "17. agriculture_food_tech\n"
-        "18. sports_athletics\n"
-        "19. entertainment_media_pop_culture\n"
-        "20. travel_tourism_hospitality\n"
-        "21. sociology_anthropology_social_issues\n\n"
-        f"Topic: {topic}\n\n"
-        "Response (category code name only):"
-    )
+    prompt = CATEGORIZATION_PROMPT_TEMPLATE.format(topic=topic)
     try:
         response = llm.invoke(prompt)
         content = response.content if hasattr(response, "content") else str(response)
-        content = content.strip().lower().replace("'", "").replace('"', '')
+        content = content.strip().lower().replace("'", "").replace('"', "")
         for cat in CATEGORY_INSTRUCTIONS.keys():
             if cat in content:
                 return cat
     except Exception as e:
         print(f"  - [warning] Categorization failed: {e}", flush=True)
-    return "geopolitics_international_relations"
+    return DEFAULT_CATEGORY
 
 
-def build_research_agent(llm: BaseChatModel, category: str = "geopolitics_international_relations") -> Any:
-    """Construct the tool-calling research agent.
+# ---------------------------------------------------------------------------
+# JSON helpers — LLM structured-output is prompted for, but parsed
+# defensively since not every backend behind Omniroute's "auto" model
+# guarantees strict JSON.
+# ---------------------------------------------------------------------------
 
-    The agent is initialized with search tools customized for the given category.
+def _extract_json_block(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?", "", text).strip()
+    text = re.sub(r"```$", "", text).strip()
+    starts = [i for i in (text.find("["), text.find("{")) if i != -1]
+    if not starts:
+        return text
+    start = min(starts)
+    end = max(text.rfind("]"), text.rfind("}"))
+    if end == -1 or end < start:
+        return text
+    return text[start : end + 1]
+
+
+def _safe_json_loads(text: str, default: Any) -> Any:
+    try:
+        return json.loads(_extract_json_block(text))
+    except Exception:
+        return default
+
+
+VALID_TOOLS = {
+    "tavily_news", "tavily_deep", "serper_recent", "serper_deep",
+    "wikipedia", "ddg_recent", "ddg_deep", "arxiv",
+}
+
+
+def _coerce_queries(raw: Any, available: set[str], fallback_recent: str, fallback_deep: str) -> list[PlannedQuery]:
+    """Turn loosely-parsed JSON into a validated list of PlannedQuery, remapping
+    any tool name that isn't actually available (e.g. no TAVILY_API_KEY) to a
+    working substitute so the plan never silently produces zero queries.
     """
-    tools = build_search_tools(category)
+    items = raw if isinstance(raw, list) else raw.get("queries", []) if isinstance(raw, dict) else []
+    out: list[PlannedQuery] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        query = str(item.get("query", "")).strip()
+        if not query:
+            continue
+        tool = str(item.get("tool", "")).strip()
+        if tool not in VALID_TOOLS:
+            tool = fallback_deep
+        if tool not in available:
+            is_recency = tool in ("tavily_news", "serper_recent", "ddg_recent")
+            tool = fallback_recent if is_recency else fallback_deep
+        if tool not in available:
+            continue
+        out.append(PlannedQuery(tool=tool, query=query, reason=str(item.get("reason", ""))[:200]))
+    return out[: config.MAX_QUERIES_PER_ITERATION]
 
-    # Attempt to load category-specific detailed prompt from file
-    prompt_file = Path("prompts") / f"{category}.md"
-    if prompt_file.exists():
+
+def build_research_agent(llm: BaseChatModel, category: str = DEFAULT_CATEGORY) -> Any:
+    """Construct and compile the deep-research LangGraph for the given category."""
+    toolkit = build_search_toolkit(category)
+    available = set(toolkit.keys())
+
+    # Sensible fallbacks if the ideal tool isn't configured (no API key).
+    fallback_recent = next((t for t in ("tavily_news", "serper_recent", "ddg_recent") if t in available), "ddg_recent")
+    fallback_deep = next((t for t in ("tavily_deep", "serper_deep", "wikipedia", "ddg_deep") if t in available), "wikipedia")
+
+    category_instructions = CATEGORY_INSTRUCTIONS.get(category, CATEGORY_INSTRUCTIONS[DEFAULT_CATEGORY])
+
+    # --- Node: plan ---------------------------------------------------------
+    def plan_node(state: ResearchState) -> dict:
+        iteration = state.get("iteration", 0)
+        topic = state["topic"]
+        today_human = state["today_human"]
+
+        if iteration == 0:
+            gap_note = ""
+            n_queries = "3-5"
+        else:
+            missing = state.get("missing_aspects", [])
+            gap_note = (
+                "This is a FOLLOW-UP research round. The previous brief was still "
+                "missing these specific things:\n"
+                + "\n".join(f"- {m}" for m in missing)
+                + "\nYour queries must target ONLY closing these gaps — do not "
+                "re-research things already covered.\n\n"
+            )
+            n_queries = "2-3"
+
+        prompt = f"""Today's date is {today_human}. You are planning search queries for a research brief on the topic: "{topic}".
+
+{category_instructions}
+
+{gap_note}Available tools (use ONLY these exact names): {sorted(available)}
+  - tavily_news / serper_recent / ddg_recent = restricted to the last {config.NEWS_RECENCY_DAYS} days. Use for anything time-sensitive.
+  - tavily_deep / serper_deep / ddg_deep / wikipedia = unrestricted background/definitional search.
+  - arxiv = academic preprints (only if the topic is scientific/technical).
+
+Generate a JSON array of {n_queries} search queries. Each item must be:
+{{"tool": "<one of the available tool names above>", "query": "<search string>", "reason": "<short phrase>"}}
+
+Rules:
+- At least one query MUST explicitly target the most recent news/developments — phrase it with words like "latest", "{today_human.split()[-1]}", or a specific recent month/year, and use a recency-restricted tool.
+- Unless this is a follow-up round, include at least one background/definition query using an unrestricted tool.
+- Do not duplicate query text across tools.
+- Return ONLY the raw JSON array — no prose, no markdown code fences.
+"""
         try:
-            prompt = prompt_file.read_text(encoding="utf-8")
-            print(f"  - Loaded detailed research prompt from: {prompt_file}", flush=True)
+            response = llm.invoke(prompt)
+            content = response.content if hasattr(response, "content") else str(response)
         except Exception as e:
-            print(f"  - [warning] Failed to read prompt file {prompt_file}: {e}. Falling back to default system prompt.", flush=True)
-            category_instructions = CATEGORY_INSTRUCTIONS.get(category, CATEGORY_INSTRUCTIONS["geopolitics_international_relations"])
-            prompt = RESEARCH_SYSTEM_PROMPT.format(category_instructions=category_instructions)
-    else:
-        print(f"  - [warning] Detailed prompt file {prompt_file} not found. Falling back to default system prompt.", flush=True)
-        category_instructions = CATEGORY_INSTRUCTIONS.get(category, CATEGORY_INSTRUCTIONS["geopolitics_international_relations"])
-        prompt = RESEARCH_SYSTEM_PROMPT.format(category_instructions=category_instructions)
+            print(f"  - [warning] Query planning failed: {e}", flush=True)
+            content = "[]"
 
-    agent = create_react_agent(
-        model=llm,
-        tools=tools,
-        prompt=prompt,
-    )
-    return agent
+        parsed = _safe_json_loads(content, default=[])
+        queries = _coerce_queries(parsed, available, fallback_recent, fallback_deep)
+
+        if not queries:
+            # Guaranteed minimal plan so the graph always makes forward progress.
+            queries = [
+                PlannedQuery(tool=fallback_recent, query=f"latest {topic} news {today_human}", reason="fallback recency query"),
+                PlannedQuery(tool=fallback_deep, query=f"{topic} overview", reason="fallback background query"),
+            ]
+
+        for q in queries:
+            print(f"  - [plan] ({q.tool}) {q.query}", flush=True)
+
+        return {"planned_queries": queries}
+
+    # --- Node: search --------------------------------------------------------
+    def _run_one(pq: PlannedQuery) -> dict:
+        tool_obj = toolkit.get(pq.tool)
+        if tool_obj is None:
+            return {"tool": pq.tool, "query": pq.query, "content": ""}
+        try:
+            result = tool_obj.invoke({"query": pq.query})
+        except Exception as e:
+            result = f"[tool error: {e}]"
+        content = str(result)
+        if len(content) > 4000:
+            content = content[:4000] + " ...[truncated]"
+        return {"tool": pq.tool, "query": pq.query, "content": content}
+
+    def search_node(state: ResearchState) -> dict:
+        planned = state.get("planned_queries", [])
+        results: list[dict] = []
+        with ThreadPoolExecutor(max_workers=config.MAX_PARALLEL_SEARCHES) as ex:
+            futures = {ex.submit(_run_one, pq): pq for pq in planned}
+            for fut in as_completed(futures):
+                pq = futures[fut]
+                try:
+                    rec = fut.result()
+                except Exception as e:
+                    rec = {"tool": pq.tool, "query": pq.query, "content": f"[error: {e}]"}
+                print(f"  - [search] '{rec['tool']}' returned {len(rec['content'])} chars for: {rec['query']}", flush=True)
+                results.append(rec)
+
+        collected = list(state.get("collected", [])) + results
+        return {"collected": collected}
+
+    # --- Node: synthesize -----------------------------------------------------
+    def synthesize_node(state: ResearchState) -> dict:
+        topic = state["topic"]
+        today_human = state["today_human"]
+        collected = state.get("collected", [])
+
+        evidence_blocks = []
+        for rec in collected:
+            evidence_blocks.append(
+                f"### Source call: {rec['tool']} | query: {rec['query']}\n{rec['content']}"
+            )
+        evidence_text = "\n\n".join(evidence_blocks) if evidence_blocks else "(no search results collected)"
+
+        prompt = f"""Today's date is {today_human}. You are compiling a research brief on: "{topic}".
+
+{category_instructions}
+
+Below are raw search results gathered from multiple tools/queries. Synthesize
+them into ONE consolidated, well-organized research brief. CRITICAL:
+- Explicitly call out dates whenever a source result mentions one (e.g. "on
+  3 July 2026, ..."). Never blur a dated fact into a vague "recently".
+- Preserve every concrete statistic, name, and specific example you find.
+- Keep the source URL next to each fact you cite from it.
+- If the evidence contains conflicting recent claims, note the discrepancy
+  rather than silently picking one.
+- Do not invent facts not present in the evidence below.
+
+Raw evidence:
+{evidence_text}
+
+Write the brief in exactly this structure:
+
+## Definition
+(short paragraph)
+
+## Key subtopics
+- Subtopic A — one-line description
+- Subtopic B — one-line description
+
+## Recent developments / examples (as of {today_human})
+- Dated fact or example, with source URL in parentheses
+- ...
+
+## Notable sources
+- URL 1
+- URL 2
+
+Only include the brief itself — no preamble, no meta-commentary.
+"""
+        try:
+            response = llm.invoke(prompt)
+            brief = response.content if hasattr(response, "content") else str(response)
+        except Exception as e:
+            print(f"  - [warning] Synthesis failed: {e}", flush=True)
+            brief = evidence_text
+
+        return {"brief": brief}
+
+    # --- Node: reflect ---------------------------------------------------------
+    def reflect_node(state: ResearchState) -> dict:
+        iteration = state.get("iteration", 0) + 1
+        today_human = state["today_human"]
+        brief = state.get("brief", "")
+
+        prompt = f"""Today's date is {today_human}. Review this research brief:
+
+---
+{brief}
+---
+
+Does the "Recent developments" section contain SPECIFIC, DATED facts or
+events from roughly the last {config.NEWS_RECENCY_DAYS}-{config.NEWS_RECENCY_DAYS * 2} days, each with a source URL?
+(Generic, undated statements like "the situation continues to evolve" do NOT count.)
+
+Return ONLY a JSON object, no prose:
+{{"has_recent_dated_facts": true or false, "missing_aspects": ["short phrase", ...], "follow_up_queries": []}}
+
+missing_aspects should be empty if has_recent_dated_facts is true.
+"""
+        try:
+            response = llm.invoke(prompt)
+            content = response.content if hasattr(response, "content") else str(response)
+        except Exception as e:
+            print(f"  - [warning] Reflection failed: {e}", flush=True)
+            content = '{"has_recent_dated_facts": true, "missing_aspects": []}'
+
+        parsed = _safe_json_loads(content, default={"has_recent_dated_facts": True, "missing_aspects": []})
+        has_recent = bool(parsed.get("has_recent_dated_facts", True))
+        missing = parsed.get("missing_aspects", []) or []
+        if not isinstance(missing, list):
+            missing = [str(missing)]
+
+        print(f"  - [reflect] iteration={iteration} has_recent_dated_facts={has_recent} missing={missing}", flush=True)
+
+        return {"iteration": iteration, "has_recent_dated_facts": has_recent, "missing_aspects": missing}
+
+    def route_after_reflect(state: ResearchState) -> str:
+        if state.get("has_recent_dated_facts", True):
+            return "end"
+        if state.get("iteration", 0) >= state.get("max_iterations", config.DEEP_RESEARCH_MAX_ITERATIONS):
+            print("  - [reflect] max iterations reached, finalizing with best available brief.", flush=True)
+            return "end"
+        return "continue"
+
+    # --- Node: finalize ---------------------------------------------------------
+    def finalize_node(state: ResearchState) -> dict:
+        brief = state.get("brief", "")
+        today_human = state["today_human"]
+
+        urls = re.findall(r"https?://[^\s)\]\}<>]+", brief)
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for u in urls:
+            u = u.rstrip(".,;:!?")
+            if u not in seen:
+                seen.add(u)
+                cleaned.append(u)
+
+        header = f"_Research compiled on {today_human}. Recency window: last {config.NEWS_RECENCY_DAYS} days for news._\n\n"
+        final_brief = header + brief.strip()
+
+        return {"brief": final_brief, "source_urls": cleaned}
+
+    graph = StateGraph(ResearchState)
+    graph.add_node("plan", plan_node)
+    graph.add_node("search", search_node)
+    graph.add_node("synthesize", synthesize_node)
+    graph.add_node("reflect", reflect_node)
+    graph.add_node("finalize", finalize_node)
+
+    graph.set_entry_point("plan")
+    graph.add_edge("plan", "search")
+    graph.add_edge("search", "synthesize")
+    graph.add_edge("synthesize", "reflect")
+    graph.add_conditional_edges("reflect", route_after_reflect, {"continue": "plan", "end": "finalize"})
+    graph.add_edge("finalize", END)
+
+    return graph.compile()
 
 
 def run_research(agent: Any, topic: str) -> str:
-    """Run the research agent and return the consolidated research brief text.
+    """Run the deep-research graph and return the consolidated research brief text."""
+    print("  - Starting deep research graph...", flush=True)
 
-    Uses `agent.stream` to output progress indicators in real-time,
-    preventing the pipeline from feeling stuck on CPU.
-    """
-    print("  - Starting agentic research stream...", flush=True)
-    
-    last_message = None
+    initial_state: ResearchState = {
+        "topic": topic,
+        "today": config.TODAY_STR,
+        "today_human": config.TODAY_HUMAN,
+        "iteration": 0,
+        "max_iterations": config.DEEP_RESEARCH_MAX_ITERATIONS,
+        "planned_queries": [],
+        "collected": [],
+        "brief": "",
+        "has_recent_dated_facts": False,
+        "missing_aspects": [],
+        "source_urls": [],
+    }
+
+    final_state: dict = {}
     try:
-        for chunk in agent.stream(
-            {"messages": [{"role": "user", "content": f"Topic: {topic}"}]},
-            config={"recursion_limit": 25},
-        ):
-            if "agent" in chunk:
-                messages = chunk["agent"].get("messages", [])
-                if messages:
-                    last_message = messages[-1]
-                    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-                        for tc in last_message.tool_calls:
-                            print(f"  - Agent calling tool '{tc['name']}' with query: '{tc['args'].get('query', '')}'...", flush=True)
-                    else:
-                        print("  - Agent is compiling the research brief...", flush=True)
-            elif "tools" in chunk:
-                messages = chunk["tools"].get("messages", [])
-                if messages:
-                    for msg in messages:
-                        content_len = len(msg.content) if hasattr(msg, "content") else 0
-                        print(f"  - Tool '{msg.name}' returned {content_len} characters of results.", flush=True)
+        for step in agent.stream(initial_state, config={"recursion_limit": 50}):
+            for node_name, node_state in step.items():
+                print(f"  - [graph] completed node: {node_name}", flush=True)
+                final_state.update(node_state or {})
     except Exception as e:
-        print(f"  - [warning] Research stream error: {e}", flush=True)
+        print(f"  - [warning] Research graph error: {e}", flush=True)
 
-    if last_message is not None:
-        if hasattr(last_message, "content"):
-            return last_message.content
-        if isinstance(last_message, dict):
-            return last_message.get("content", "")
-        return str(last_message)
-    return ""
+    return final_state.get("brief", "")
 
 
-__all__ = ["build_research_agent", "run_research", "categorize_topic"]
+def get_source_urls(agent_result_brief: str) -> list[str]:
+    """Convenience helper if a caller only has the brief text on hand."""
+    urls = re.findall(r"https?://[^\s)\]\}<>]+", agent_result_brief)
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for u in urls:
+        u = u.rstrip(".,;:!?")
+        if u not in seen:
+            seen.add(u)
+            cleaned.append(u)
+    return cleaned
+
+
+__all__ = ["build_research_agent", "run_research", "categorize_topic", "get_source_urls"]

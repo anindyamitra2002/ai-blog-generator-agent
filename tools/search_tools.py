@@ -1,20 +1,31 @@
 """Instantiate LangChain's built-in research / search tools.
 
 All tools here are maintained LangChain integrations — no custom search
-client or scraper code. The research agent receives the entire list at
-once and reasons about which tool to call and in what order, rather
+client or scraper code. Two flavors of most engines are provided:
+
+  * a "recent" / "news" variant that is date-window restricted (Tavily's
+    native `topic="news"` + `days=`, Serper's `tbs=qdr:*` time filter, and
+    DuckDuckGo's `time=` window) — used by the deep-research graph whenever
+    it needs to answer "what happened recently".
+  * a "deep" / general variant with no time restriction — used for
+    background, definitions, and canonical context.
+
+The deep-research graph (``agent/research_agent.py``) decides for itself,
+per iteration, which of these tools to call and with what query, rather
 than following a hardcoded call sequence.
 """
 
 from __future__ import annotations
 
+from langchain_core.tools import BaseTool, tool
+
 from config import (
     ENABLE_ARXIV,
+    NEWS_RECENCY_DAYS,
+    SERPER_API_KEY,
     TAVILY_API_KEY,
     TAVILY_MAX_RESULTS,
-    SERPER_API_KEY,
 )
-from langchain_core.tools import BaseTool, tool
 
 CATEGORY_SOURCES = {
     "geopolitics_international_relations": [
@@ -103,153 +114,234 @@ CATEGORY_SOURCES = {
     ]
 }
 
+DEFAULT_CATEGORY = "geopolitics_international_relations"
+
 
 def modify_query_by_category(query: str, category: str) -> str:
-    """Modifies the search query to focus strictly on the 10+ trusted domains for the category."""
+    """Restrict a query to the trusted domain list for its category."""
     query = query.strip()
-    sources = CATEGORY_SOURCES.get(category, CATEGORY_SOURCES["geopolitics_international_relations"])
-    
-    # Formulate site filter suffix: (site:domain1 OR site:domain2 OR ...)
+    sources = CATEGORY_SOURCES.get(category, CATEGORY_SOURCES[DEFAULT_CATEGORY])
     site_filter = " OR ".join(f"site:{domain}" for domain in sources)
-    
-    # Check if a site filter is already present in the query
     if "site:" in query.lower():
         return query
-        
     return f"{query} ({site_filter})"
 
 
-def build_search_tools(category: str = "geopolitics_international_relations") -> list[BaseTool]:
-    """Return the list of research tools available to the agent, customized for the category.
+def build_search_toolkit(category: str = DEFAULT_CATEGORY) -> dict[str, BaseTool]:
+    """Return a dict mapping logical tool keys to ready-to-invoke tools.
 
-    Tools included:
-      1. Tavily search — AI-optimized, pre-ranked and summarized results (advanced depth, category filtered).
-         (Skipped if TAVILY_API_KEY is not set.)
-      2. Wikipedia query — canonical background facts, no API key required.
-      3. DuckDuckGo search — general/fallback web search, no API key required (category filtered).
-      4. Arxiv query — academic preprints, enabled by ENABLE_ARXIV.
-      5. Google Serper search — deep search tool using Google SERP API (category filtered).
-         (Skipped if SERPER_API_KEY is not set.)
+    Keys match ``schemas.PlannedQuery.tool`` so the research graph can look
+    up ``toolkit[planned.tool].invoke({"query": planned.query})`` directly,
+    without going through an agentic tool-selection loop.
+
+    Keys: tavily_news, tavily_deep, serper_recent, serper_deep, wikipedia,
+    ddg_recent, ddg_deep, arxiv (only if ENABLE_ARXIV / keys present).
     """
-    tools: list[BaseTool] = []
+    sources = CATEGORY_SOURCES.get(category, CATEGORY_SOURCES[DEFAULT_CATEGORY])
+    toolkit: dict[str, BaseTool] = {}
 
-    # --- 1. Tavily ---------------------------------------------------------
+    # --- Tavily: recent news + general deep search --------------------
     if TAVILY_API_KEY:
         from langchain_tavily import TavilySearch
 
-        sources = CATEGORY_SOURCES.get(category, CATEGORY_SOURCES["geopolitics_international_relations"])
-
-        # Base tool with advanced search depth and native domain restrictions
-        tavily_base = TavilySearch(
+        tavily_news_base = TavilySearch(
             tavily_api_key=TAVILY_API_KEY,
-            max_results=max(TAVILY_MAX_RESULTS, 10),
+            max_results=max(TAVILY_MAX_RESULTS, 8),
             search_depth="advanced",
+            topic="news",
+            days=NEWS_RECENCY_DAYS,
             include_domains=sources,
         )
 
-        @tool("tavily_search_deep")
-        def tavily_search_deep(query: str) -> str:
-            """A deep AI-optimized web search tool that returns pre-ranked, summarized
-            results specifically from trusted, categorized resources. Input is a search query string.
+        @tool("tavily_news")
+        def tavily_news(query: str) -> str:
+            """Search recent NEWS only (last few days/weeks) via Tavily's
+            news index, restricted to trusted category domains. Use this for
+            'latest developments', 'this week', or anything time-sensitive.
+            Input is a search query string — include the topic and,
+            ideally, the word 'latest' or a specific recent timeframe.
             """
-            return tavily_base.invoke({"query": query})
+            try:
+                return str(tavily_news_base.invoke({"query": query}))
+            except Exception as e:
+                return f"Tavily news search failed: {e}"
 
-        tools.append(tavily_search_deep)
+        toolkit["tavily_news"] = tavily_news
 
-    # --- 2. Wikipedia ------------------------------------------------------
+        tavily_deep_base = TavilySearch(
+            tavily_api_key=TAVILY_API_KEY,
+            max_results=max(TAVILY_MAX_RESULTS, 8),
+            search_depth="advanced",
+            topic="general",
+            include_domains=sources,
+        )
+
+        @tool("tavily_deep")
+        def tavily_deep(query: str) -> str:
+            """Deep, AI-ranked general web search via Tavily, restricted to
+            trusted category domains. Use for background, definitions, and
+            established context (not time-sensitive). Input is a query string.
+            """
+            try:
+                return str(tavily_deep_base.invoke({"query": query}))
+            except Exception as e:
+                return f"Tavily deep search failed: {e}"
+
+        toolkit["tavily_deep"] = tavily_deep
+
+    # --- Wikipedia -------------------------------------------------------
     from langchain_community.tools import WikipediaQueryRun
     from langchain_community.utilities import WikipediaAPIWrapper
 
     wikipedia_base = WikipediaQueryRun(
-        api_wrapper=WikipediaAPIWrapper(
-            top_k_results=1,
-            doc_content_chars_max=1200,
-        )
+        api_wrapper=WikipediaAPIWrapper(top_k_results=1, doc_content_chars_max=1500)
     )
 
     @tool("wikipedia")
     def wikipedia(query: str) -> str:
-        """Useful for looking up canonical background facts, definitions,
-        and historical context about well-known topics (people, places,
-        concepts, events). Input should be a short search query — a topic
-        name or a single noun phrase.
+        """Canonical background facts, definitions, and historical context
+        for well-known people, places, concepts, and events. NOT for recent
+        news. Input should be a short topic name or noun phrase.
         """
         try:
             return wikipedia_base.invoke({"query": query})
         except Exception as e:
-            return f"Wikipedia search is currently unavailable (Error: {e}). Please use other search tools like Tavily or DuckDuckGo."
+            return f"Wikipedia search unavailable ({e}). Use another tool instead."
 
-    tools.append(wikipedia)
+    toolkit["wikipedia"] = wikipedia
 
-    # --- 3. DuckDuckGo -----------------------------------------------------
+    # --- DuckDuckGo: recent + general -------------------------------------
     from langchain_community.tools import DuckDuckGoSearchResults
     from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 
-    # Base tool localized to India English
-    ddg_base = DuckDuckGoSearchResults(
-        api_wrapper=DuckDuckGoSearchAPIWrapper(region="in-en"),
-        num_results=max(TAVILY_MAX_RESULTS, 10),
+    ddg_recent_base = DuckDuckGoSearchResults(
+        api_wrapper=DuckDuckGoSearchAPIWrapper(region="in-en", time="w"),
+        num_results=max(TAVILY_MAX_RESULTS, 8),
     )
 
-    @tool("duckduckgo_search_india")
-    def duckduckgo_search_india(query: str) -> str:
-        """A general-purpose web search engine localized to India. Use this for Indian news,
-        regional references, blogs, and official press releases. Input is a search
-        query string.
+    @tool("ddg_recent")
+    def ddg_recent(query: str) -> str:
+        """General-purpose web search restricted to results from the past
+        week, localized to India. Use for recent news when Tavily/Serper
+        are unavailable. Input is a search query string.
         """
         modified = modify_query_by_category(query, category)
-        return ddg_base.invoke({"query": modified})
+        try:
+            return ddg_recent_base.invoke({"query": modified})
+        except Exception as e:
+            return f"DuckDuckGo recent search failed: {e}"
 
-    tools.append(duckduckgo_search_india)
+    toolkit["ddg_recent"] = ddg_recent
 
-    # --- 4. (Optional) Arxiv ------------------------------------------------
+    ddg_deep_base = DuckDuckGoSearchResults(
+        api_wrapper=DuckDuckGoSearchAPIWrapper(region="in-en"),
+        num_results=max(TAVILY_MAX_RESULTS, 8),
+    )
+
+    @tool("ddg_deep")
+    def ddg_deep(query: str) -> str:
+        """General-purpose web search localized to India, no time
+        restriction. Use for background, official releases, regional
+        references. Input is a search query string.
+        """
+        modified = modify_query_by_category(query, category)
+        try:
+            return ddg_deep_base.invoke({"query": modified})
+        except Exception as e:
+            return f"DuckDuckGo search failed: {e}"
+
+    toolkit["ddg_deep"] = ddg_deep
+
+    # --- (Optional) Arxiv --------------------------------------------------
     if ENABLE_ARXIV:
         from langchain_community.tools import ArxivQueryRun
         from langchain_community.utilities import ArxivAPIWrapper
 
-        arxiv = ArxivQueryRun(
+        arxiv_base = ArxivQueryRun(
             api_wrapper=ArxivAPIWrapper(
-                top_k_results=1,
-                load_max_docs=1,
-                doc_content_chars_max=1200,
-            ),
-            name="arxiv",
-            description=(
-                "Search academic preprints on arXiv. Use this when the topic "
-                "would benefit from peer-reviewed scientific grounding — e.g. "
-                "machine learning, physics, math, biology research. Input is "
-                "a search query string."
-            ),
-        )
-        tools.append(arxiv)
-
-    # --- 5. Google Serper --------------------------------------------------
-    if SERPER_API_KEY:
-        from langchain_community.tools import GoogleSerperRun
-        from langchain_community.utilities import GoogleSerperAPIWrapper
-
-        # Base tool initialized with India geoloc and English language
-        serper_base = GoogleSerperRun(
-            api_wrapper=GoogleSerperAPIWrapper(
-                serper_api_key=SERPER_API_KEY,
-                gl="in",
-                hl="en",
-                k=10
+                top_k_results=3, load_max_docs=3, doc_content_chars_max=1500
             )
         )
 
-        @tool("google_serper_search_deep")
-        def google_serper_search_deep(query: str) -> str:
-            """A deep Google search tool that retrieves organic search results and snippets
-            specifically from Indian news portals, official publications, and press releases.
-            Input is a search query string.
+        @tool("arxiv")
+        def arxiv(query: str) -> str:
+            """Search academic preprints on arXiv. Use for machine learning,
+            physics, math, or biology research topics. Input is a query string.
+            """
+            try:
+                return arxiv_base.invoke({"query": query})
+            except Exception as e:
+                return f"Arxiv search failed: {e}"
+
+        toolkit["arxiv"] = arxiv
+
+    # --- Google Serper: recent (tbs time filter) + general ------------------
+    if SERPER_API_KEY:
+        from langchain_community.utilities import GoogleSerperAPIWrapper
+
+        # Map the recency window to Google's "tbs" time-filter buckets.
+        if NEWS_RECENCY_DAYS <= 1:
+            tbs_value = "qdr:d"
+        elif NEWS_RECENCY_DAYS <= 7:
+            tbs_value = "qdr:w"
+        elif NEWS_RECENCY_DAYS <= 31:
+            tbs_value = "qdr:m"
+        else:
+            tbs_value = "qdr:y"
+
+        try:
+            serper_recent_wrapper = GoogleSerperAPIWrapper(
+                serper_api_key=SERPER_API_KEY, gl="in", hl="en", k=10, tbs=tbs_value, type="news"
+            )
+        except TypeError:
+            # Older langchain_community versions may not accept tbs/type.
+            serper_recent_wrapper = GoogleSerperAPIWrapper(
+                serper_api_key=SERPER_API_KEY, gl="in", hl="en", k=10
+            )
+
+        @tool("serper_recent")
+        def serper_recent(query: str) -> str:
+            """Google News search via Serper, time-filtered to the recent
+            window. Use this specifically to find the latest news, events,
+            or announcements. Input is a search query string.
             """
             modified = modify_query_by_category(query, category)
-            return serper_base.invoke({"query": modified})
+            try:
+                return serper_recent_wrapper.run(modified)
+            except Exception as e:
+                return f"Serper recent search failed: {e}"
 
-        tools.append(google_serper_search_deep)
+        toolkit["serper_recent"] = serper_recent
 
-    return tools
+        serper_deep_wrapper = GoogleSerperAPIWrapper(
+            serper_api_key=SERPER_API_KEY, gl="in", hl="en", k=10
+        )
+
+        @tool("serper_deep")
+        def serper_deep(query: str) -> str:
+            """General Google search via Serper (organic results), no time
+            restriction. Use for background, official publications, and
+            established context. Input is a search query string.
+            """
+            modified = modify_query_by_category(query, category)
+            try:
+                return serper_deep_wrapper.run(modified)
+            except Exception as e:
+                return f"Serper search failed: {e}"
+
+        toolkit["serper_deep"] = serper_deep
+
+    return toolkit
 
 
-__all__ = ["build_search_tools"]
+def available_tool_keys(toolkit: dict[str, BaseTool]) -> list[str]:
+    """List of tool keys actually available given current API key config."""
+    return list(toolkit.keys())
+
+
+__all__ = [
+    "CATEGORY_SOURCES",
+    "modify_query_by_category",
+    "build_search_toolkit",
+    "available_tool_keys",
+]

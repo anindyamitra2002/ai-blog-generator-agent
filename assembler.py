@@ -9,12 +9,12 @@ debugging / resumability.
 
 from __future__ import annotations
 
-import datetime as dt
 import re
 from pathlib import Path
 
 import requests
 
+import config
 from schemas import ImageResult, PostMetadata
 
 
@@ -79,7 +79,7 @@ def assemble_markdown(
         cover_image_rel = ""
         credit_line = "No cover image available."
 
-    date_str = dt.datetime.now().strftime("%Y-%m-%d")
+    date_str = config.TODAY_STR
 
     # --- YAML frontmatter -------------------------------------------------
     frontmatter = (
@@ -87,6 +87,7 @@ def assemble_markdown(
         f'title: "{_yaml_escape(title)}"\n'
         f'description: "{_yaml_escape(description)}"\n'
         f"date: {date_str}\n"
+        f"last_updated: {date_str}\n"
         f"cover: {cover_image_rel}\n"
         f'image_credit: "{_yaml_escape(credit_line)}"\n'
         "---\n\n"
@@ -100,6 +101,9 @@ def assemble_markdown(
             f"*{credit_line}*\n\n"
         )
 
+    # --- Currency note ------------------------------------------------------
+    currency_note = f"*Published {config.TODAY_HUMAN}. Data current as of this date.*\n\n"
+
     # --- Sources block ----------------------------------------------------
     sources_block = ""
     if sources:
@@ -110,11 +114,13 @@ def assemble_markdown(
 
     # --- Title + body -----------------------------------------------------
     # The editor pass already produced a clean intro paragraph + section
-    # headings + conclusion, so we just prepend the H1 title.
+    # headings + conclusion, so we just prepend the H1 title and a
+    # currency note before it.
     full_markdown = (
         frontmatter
         + image_block
         + f"# {title}\n\n"
+        + currency_note
         + body_markdown.strip()
         + "\n\n"
         + sources_block
@@ -129,6 +135,7 @@ def assemble_markdown(
         slug=slug,
         title=title,
         description=description,
+        generated_date=date_str,
         cover_image_path=cover_image_rel,
         cover_image_credit=credit_line,
         sources=sources,

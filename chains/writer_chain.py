@@ -10,13 +10,16 @@ from __future__ import annotations
 from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
 
+import config
 from schemas import SectionOutline
-
 
 WRITER_INSTRUCTIONS = """You are a skilled technical journalist and blog writer. Write a single section of a blog post as a comprehensive, detail-rich report.
 
+Today's date is {today_human}. Write with the awareness that a reader is reading this on {today_human} — the post must feel current, not like a generic evergreen explainer.
+
 Constraints:
 - **Fact-Dense Writing**: Ground every claim in the research brief provided. Include every concrete fact, statistic, percentage, date, metric, name, and specific example mentioned in the research brief for this section. Do NOT generalize, gloss over, or smooth out specific numbers/details.
+- **Date Precision**: Whenever the research brief attaches a specific date to a fact or event, state that date explicitly in the prose (e.g. "On 3 July 2026, ..." or "As of {today_human}, ..."). Never substitute a vague word like "recently" or "currently" for a date that the research brief actually gives you.
 - **Source Integration & Citations**: Explicitly integrate and cite the source websites, organizations, and precise URLs in the body text (e.g. 'According to a study by the [World Economic Forum](https://weforum.org),...' or 'as reported in the [Ministry of Finance press release](https://pib.gov.in)...'). Make sure to reference the specific sources provided in the research brief to build a highly authoritative, comprehensive report.
 - **No Boilerplate Gaps**: NEVER write meta-commentary, placeholder text, or filler like 'the research brief doesn't cover this' or 'there is a noted gap in the research brief regarding...'. Focus strictly on writing the factual, grounded content itself. If information is missing for a planned point, skip it entirely and expand deeply on the details that *are* present in the research.
 - **Accessible & Professional**: Write in a clear, conversational-but-professional tone, accessible to a general technical audience.
@@ -42,7 +45,7 @@ def build_writer_chain(llm: BaseChatModel):
                 "Write the section body.",
             ),
         ]
-    )
+    ).partial(today_human=config.TODAY_HUMAN)
     return prompt | llm
 
 

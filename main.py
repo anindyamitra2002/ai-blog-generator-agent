@@ -2,7 +2,10 @@
 
 Six stages, executed in order:
   0. Memory recall       — check Mem0 for similar past topics.
-  1. Research phase      — agentic; LLM decides which tools to call.
+  1. Research phase      — agentic LangGraph deep-research loop: plan ->
+                            search -> synthesize -> reflect (repeat until
+                            the brief has dated, recent facts or the
+                            iteration budget runs out) -> finalize.
   2. Outline generation  — fixed step; topic + research → Outline object.
   3. Section writing     — fixed step; once per outlined section.
   4. Editing pass        — fixed step; full draft → polished draft.
@@ -55,16 +58,21 @@ def print_stage(stage: str) -> None:
 
 
 def build_llm():
-    """Construct the configured LLM (Ollama or OpenAI/Omniroute) from config."""
+    """Construct the configured LLM (Ollama or OpenAI-compatible/Omniroute) from config."""
     if config.LLM_PROVIDER == "openai":
         from langchain_openai import ChatOpenAI
 
         if not config.OPENAI_API_KEY:
             raise ValueError(
-                "OPENAI_API_KEY is not set. Please add your OpenRouter API key "
-                "to the OPENAI_API_KEY variable in your .env file."
+                "OPENAI_API_KEY is not set. Please add your Omniroute (or OpenAI/"
+                "OpenRouter) API key to the OPENAI_API_KEY variable in your .env file."
             )
 
+        # OPENAI_API_BASE points at the Omniroute router in this project's
+        # default .env, and OPENAI_MODEL="auto" lets Omniroute pick the best
+        # backing model per request — this is the "Omniroute LLM (auto model)"
+        # the pipeline uses end-to-end (research planning/reflection, outline,
+        # writing, and editing all share this one client).
         return ChatOpenAI(
             model=config.OPENAI_MODEL,
             openai_api_base=config.OPENAI_API_BASE,
@@ -89,8 +97,9 @@ def build_llm():
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="AI Blog Generator Agent — research, outline, write, "
-        "edit, and assemble a full blog post from a single topic string.",
+        description="AI Blog Generator Agent — deep-research (date-aware, "
+        "iterative LangGraph agent), outline, write, edit, and assemble a "
+        "full, up-to-date blog post from a single topic string.",
     )
     p.add_argument("topic", help="Topic to generate a blog post about.")
     p.add_argument(
@@ -109,7 +118,6 @@ def parse_args() -> argparse.Namespace:
 def extract_source_urls(text: str) -> list[str]:
     """Pull unique URLs from the research brief, preserving order."""
     urls = re.findall(r"https?://[^\s)\]\}<>]+", text)
-    # Trim trailing punctuation that often leaks through regex.
     cleaned: list[str] = []
     seen: set[str] = set()
     for u in urls:
@@ -126,6 +134,8 @@ def main() -> int:
     if not topic:
         print("Error: topic must not be empty.", file=sys.stderr)
         return 2
+
+    print(f"Run date: {config.TODAY_HUMAN} (recency window: last {config.NEWS_RECENCY_DAYS} days for news)")
 
     # --- Configuration validation -----------------------------------------
     issues = config.validate()
@@ -156,16 +166,16 @@ def main() -> int:
     else:
         print("[info] Memory step skipped (--skip-memory).")
 
-    # --- 1. Research phase ------------------------------------------------
-    print_stage("Research phase")
+    # --- 1. Research phase (deep-research LangGraph) -----------------------
+    print_stage("Research phase (deep search)")
     print(f"Topic: {topic}")
-    
+
     print("  - Classifying topic category...", flush=True)
     category = categorize_topic(llm, topic)
     print(f"  - Classified Category: {category.upper()}", flush=True)
-    
-    research_executor = build_research_agent(llm, category)
-    research_brief = run_research(research_executor, topic)
+
+    research_graph = build_research_agent(llm, category)
+    research_brief = run_research(research_graph, topic)
     print(f"Research brief length: {len(research_brief)} chars")
 
     source_urls = extract_source_urls(research_brief)

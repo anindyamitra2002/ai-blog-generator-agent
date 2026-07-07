@@ -1,28 +1,36 @@
 """Outline chain: topic + research → structured Outline object.
 
-This is a fixed (non-agentic) step. The raw research brief from the
-research agent is passed to the LLM with a strict instruction to produce
-a structured outline that downstream stages (writer, editor) can consume
-deterministically.
+This is a fixed (non-agentic) step. The research brief from the deep
+research graph (already date-stamped and recency-checked) is passed to the
+LLM with a strict instruction to produce a structured outline that
+downstream stages (writer, editor) can consume deterministically — and
+that explicitly plans a section covering the most recent developments.
 """
 
 from __future__ import annotations
+
+import re
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
+import config
 from schemas import Outline, SectionOutline
-import re
-
 
 OUTLINE_INSTRUCTIONS = """You are a content strategist. Given a topic and a research brief, produce a structured outline for a blog post.
 
+Today's date is {today_human}. This post must read as current and up to date — not generic.
+
 CRITICAL INSTRUCTIONS FOR DETAIL PRESERVATION:
-- Your primary goal is to ensure the outline is a detailed map of the concrete facts, figures, statistics, names, and source references found in the research brief. Do NOT generalize, summarize vaguely, or smooth over details.
-- Every section's key points MUST list specific, concrete data points, dates, metrics, case studies, or names directly from the research brief. 
-- Map the 10+ sources cited in the research brief across the outline sections, specifying which source domains or URLs must be referenced in each section.
-- Plan the sections strictly based on what is covered in the research brief. Do NOT plan sections or key points for which there is no research material, preventing the downstream writer from having to note gaps or invent boilerplate content.
+- Your primary goal is to ensure the outline is a detailed map of the concrete facts, figures, statistics, names, dates, and source references found in the research brief. Do NOT generalize, summarize vaguely, or smooth over details.
+- Every section's key points MUST list specific, concrete data points, dates, metrics, case studies, or names directly from the research brief.
+- Map the sources cited in the research brief across the outline sections, specifying which source domains or URLs must be referenced in each section.
+- Plan sections strictly based on what is covered in the research brief. Do NOT plan sections or key points for which there is no research material.
+
+CRITICAL INSTRUCTION FOR RECENCY:
+- At least one section MUST be dedicated to the most recent developments — title it something like "Latest Developments" or a topic-specific variant, and its key points must be the dated, recent facts from the research brief's "Recent developments" section, each anchored to a specific date where the research provides one.
+- If the research brief's "Recent developments" section is thin, fold what dated material exists into the most relevant thematic section instead of inventing a hollow section — but never omit it entirely if any dated recent fact exists in the brief.
 
 The outline must include:
 - A catchy, SEO-friendly title (not clickbait).
@@ -30,50 +38,47 @@ The outline must include:
 - An ordered list of 4-7 sections, each with:
   - A clear heading.
   - A short intent statement describing what the section covers, its specific angle, and which research facts it is grounded in.
-  - 2-4 highly specific key points (detailing facts, metrics, and source URLs) that the section must cover.
+  - 2-4 highly specific key points (detailing facts, metrics, dates, and source URLs) that the section must cover.
 
-Do not include an "Introduction" or "Conclusion" section as separate items — the editor pass will add those. Aim for sections that flow naturally from one to the next.
+Do not include an "Introduction" or "Conclusion" section as separate items — the editor pass will add those. Aim for sections that flow naturally from one to the next, ending with recency/latest-developments material so the post feels current when read top to bottom.
 """
 
 
 def try_parse_outline_markdown(text: str) -> Outline:
     """Robust fallback parser to extract an Outline object from markdown text."""
     lines = [line.strip() for line in text.split('\n')]
-    
+
     title = ""
     meta_description = ""
     sections = []
-    
+
     current_section = None
     collecting_key_points = False
-    
+
     for idx, line in enumerate(lines):
         if not line:
             continue
-            
-        # Parse title
+
         if re.search(r'\*\*Title:?\*\*', line, re.IGNORECASE):
             match = re.search(r'\*\*Title:?\*\*\s*(.+)', line, re.IGNORECASE)
             if match:
                 title = match.group(1).strip()
             elif idx + 1 < len(lines):
-                title = lines[idx+1].strip()
+                title = lines[idx + 1].strip()
             continue
-            
-        # Parse meta description
+
         if re.search(r'\*\*Meta\s*(?:description|Description):?\*\*', line, re.IGNORECASE):
             match = re.search(r'\*\*Meta\s*(?:description|Description):?\*\*\s*(.+)', line, re.IGNORECASE)
             if match:
                 meta_description = match.group(1).strip()
             elif idx + 1 < len(lines):
-                meta_description = lines[idx+1].strip()
+                meta_description = lines[idx + 1].strip()
             continue
 
-        # Parse section header (e.g. "1. **The Core Components...**", "1. Inlet...")
         section_match = re.match(r'^(?:\d+[\.\)]|#+)\s*(?:\*\*)?([^\*\n]+?)(?:\*\*)?$', line)
         if not section_match:
             section_match = re.match(r'^(?:\d+[\.\)]|#+)\s*(?:\*\*)?([^\*\n\-\–\—]+)', line)
-            
+
         if section_match and not re.search(r'intent:|key\s*points', line, re.IGNORECASE):
             heading = section_match.group(1).strip().strip(':').strip('**').strip()
             if heading and heading.lower() not in ["outline", "title", "meta description", "meta_description"]:
@@ -82,33 +87,30 @@ def try_parse_outline_markdown(text: str) -> Outline:
                 current_section = {"heading": heading, "intent": "", "key_points": []}
                 collecting_key_points = False
                 continue
-                
+
         if current_section:
-            # Parse intent
             intent_match = re.search(r'\*?Intent:?\*?\s*(.+)', line, re.IGNORECASE)
             if intent_match:
                 current_section["intent"] = intent_match.group(1).strip()
                 collecting_key_points = False
                 continue
-                
-            # Check if key points section starts
+
             if re.search(r'key\s*points:?', line, re.IGNORECASE):
                 collecting_key_points = True
                 continue
-                
-            # Parse key point bullet
+
             bullet_match = re.match(r'^[\-\*\+\u2022]\s*(.+)', line)
             if bullet_match and collecting_key_points:
                 current_section["key_points"].append(bullet_match.group(1).strip())
-                
+
     if current_section:
         sections.append(current_section)
-        
+
     if not title:
         title = "Untitled Blog Post"
     if not meta_description:
         meta_description = "Blog post about the selected topic."
-        
+
     valid_sections = []
     for s in sections:
         if not s["heading"]:
@@ -120,7 +122,7 @@ def try_parse_outline_markdown(text: str) -> Outline:
                 key_points=s["key_points"] if s["key_points"] else ["General overview."]
             )
         )
-        
+
     return Outline(title=title, meta_description=meta_description, sections=valid_sections)
 
 
@@ -128,7 +130,6 @@ def build_outline_chain(llm: BaseChatModel):
     """Build the prompt | llm | parser chain for outline generation."""
     parser = PydanticOutputParser(pydantic_object=Outline)
 
-    # Attempt to bind JSON response format if supported
     if hasattr(llm, "bind"):
         try:
             llm = llm.bind(response_format={"type": "json_object"})
@@ -144,7 +145,10 @@ def build_outline_chain(llm: BaseChatModel):
                 "Topic: {topic}\n\nResearch brief:\n{research}\n\nProduce the outline.",
             ),
         ]
-    ).partial(format_instructions=parser.get_format_instructions())
+    ).partial(
+        format_instructions=parser.get_format_instructions(),
+        today_human=config.TODAY_HUMAN,
+    )
 
     return prompt | llm | parser
 
