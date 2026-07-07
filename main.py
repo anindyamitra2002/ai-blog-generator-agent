@@ -13,14 +13,6 @@ Five stages, executed in order:
   4. Editing pass        — fixed step; full draft → polished draft.
   5. Image + assembly    — fetch cover image, write post.md + meta.json.
 
-NOTE ON MEMORY: the Mem0 recall/record stage that used to run before step 1
-and after step 5 has been REMOVED from this pipeline. It was recalling and
-surfacing old/stale content that ended up bleeding into new generations —
-the opposite of what a "must be current as of today" pipeline needs.
-``memory/mem0_store.py`` is still in the repo for reference, but nothing in
-this file imports or calls it anymore. If you want memory back, treat that
-as a deliberate, separate decision rather than re-enabling it silently.
-
 Usage:
     python main.py "the topic you want a blog post about"
     python main.py "some topic" --skip-image

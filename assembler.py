@@ -30,14 +30,59 @@ def slugify(text: str) -> str:
     return slug or "untitled"
 
 
+# Same rationale as tools/image_tool.py: a plain requests.get() with no
+# browser-like headers gets blocked/redirected by a lot of hotlink-
+# protected hosts, and the resulting HTML error page (or empty/placeholder
+# body) was getting written straight to cover.jpg as if it were a real
+# image — that's what "corrupted cover image" actually was.
+_IMAGE_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+}
+_MIN_IMAGE_BYTES = 2000
+_IMAGE_MAGIC_BYTES = (
+    b"\xff\xd8\xff",          # JPEG
+    b"\x89PNG\r\n\x1a\n",     # PNG
+    b"GIF87a",                # GIF
+    b"GIF89a",                # GIF
+    b"RIFF",                  # WEBP (RIFF....WEBP)
+)
+
+
+def _looks_like_image(content: bytes, content_type: str = "") -> bool:
+    """Best-effort check that ``content`` is real image data, not an HTML
+    error page, JSON error body, or empty/placeholder response."""
+    if not content or len(content) < _MIN_IMAGE_BYTES:
+        return False
+    if content_type and not content_type.lower().startswith("image/"):
+        return False
+    return any(content.startswith(magic) for magic in _IMAGE_MAGIC_BYTES)
+
+
 def download_image(url: str, target_path: Path) -> None:
-    """Download an image to ``target_path``. No-op if URL is empty."""
+    """Download an image to ``target_path``. No-op if URL is empty.
+
+    Raises on network failure (caller falls back to hotlinking) AND on a
+    response that downloads fine but isn't actually valid image data
+    (caller should NOT hotlink in that case — the URL is genuinely broken,
+    so hotlinking it would just show the reader the same broken image).
+    """
     if not url:
         return
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    resp = requests.get(url, timeout=30)
+    resp = requests.get(url, headers=_IMAGE_REQUEST_HEADERS, timeout=30, allow_redirects=True)
     resp.raise_for_status()
-    target_path.write_bytes(resp.content)
+    content = resp.content
+    content_type = resp.headers.get("Content-Type", "")
+    if not _looks_like_image(content, content_type):
+        raise ValueError(
+            f"response did not look like a valid image (content-type={content_type!r}, "
+            f"{len(content)} bytes) — the source URL is likely hotlink-blocked or dead"
+        )
+    target_path.write_bytes(content)
 
 
 def _yaml_escape(s: str) -> str:
@@ -98,8 +143,18 @@ def assemble_markdown(
             download_image(image.image_url, image_path)
             cover_image_rel = f"assets/{image_filename}"
             credit_line = image.credit_text
+        except ValueError as e:
+            # The URL responded, but not with real image data (e.g. an
+            # HTML "hotlinking disabled" page). Hotlinking the same URL
+            # would show the reader that identical broken response, so
+            # there's no point falling back to it — treat as no image.
+            cover_image_rel = ""
+            credit_line = f"No cover image available (source URL was invalid: {e})"
+            print(f"  - [warning] Cover image download rejected: {e}", flush=True)
         except Exception as e:
-            # Fallback: hotlink + annotate the failure.
+            # A network/timeout/HTTP-status problem on our end, not proof
+            # the URL itself is broken — hotlink as a best-effort fallback,
+            # annotated so it's clear a local re-download wasn't confirmed.
             cover_image_rel = image.image_url
             credit_line = f"{image.credit_text} (local download failed: {e})"
     else:

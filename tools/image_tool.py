@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 import requests
 from langchain_core.tools import tool
@@ -16,6 +15,63 @@ from config import (
     TAVILY_API_KEY,
     SERPER_API_KEY,
 )
+
+# Many sites block/redirect requests that don't look like a real browser
+# (no User-Agent, no Accept header) — instead of the actual image they
+# serve a 403 HTML page, a tiny "hotlinking not allowed" placeholder, or a
+# redirect to an unrelated page. If that response body gets saved to disk
+# with a .jpg extension anyway, the result is a "corrupted" cover image
+# that no viewer can open. These headers avoid the most common blocks, and
+# _looks_like_image / _verify_image_url below make sure we never treat a
+# non-image response as a valid image in the first place.
+IMAGE_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+}
+
+# Minimum plausible size (in bytes) for a real photo. Error pages, 1x1
+# tracking pixels, and "hotlinking disabled" placeholders are almost always
+# well under this, while any genuine landscape cover photo is well over it.
+_MIN_IMAGE_BYTES = 2000
+
+_IMAGE_MAGIC_BYTES = (
+    b"\xff\xd8\xff",          # JPEG
+    b"\x89PNG\r\n\x1a\n",     # PNG
+    b"GIF87a",                # GIF
+    b"GIF89a",                # GIF
+    b"RIFF",                  # WEBP (RIFF....WEBP)
+)
+
+
+def _looks_like_image(content: bytes, content_type: str = "") -> bool:
+    """Best-effort check that ``content`` is actually image data, not an
+    HTML error page, JSON error body, or empty/placeholder response.
+    """
+    if not content or len(content) < _MIN_IMAGE_BYTES:
+        return False
+    if content_type and not content_type.lower().startswith("image/"):
+        return False
+    return any(content.startswith(magic) for magic in _IMAGE_MAGIC_BYTES)
+
+
+def _verify_image_url(url: str) -> bool:
+    """Actually download ``url`` and confirm it resolves to real, usable
+    image bytes before we commit to it as the chosen cover image. This is
+    what prevents a broken/blocked hotlink from ever being selected.
+    """
+    if not url:
+        return False
+    try:
+        resp = requests.get(
+            url, headers=IMAGE_REQUEST_HEADERS, timeout=15, allow_redirects=True
+        )
+        resp.raise_for_status()
+        return _looks_like_image(resp.content, resp.headers.get("Content-Type", ""))
+    except Exception:
+        return False
 
 
 class ImageQuery(BaseModel):
@@ -78,10 +134,10 @@ def _get_image_search_queries(title: str) -> list[str]:
     return unique_queries
 
 
-def _try_unsplash(query: str) -> Optional[dict]:
-    """Return the first qualifying Unsplash result, or None."""
+def _try_unsplash(query: str) -> list[dict]:
+    """Return all qualifying Unsplash candidates, best first."""
     if not UNSPLASH_ACCESS_KEY:
-        return None
+        return []
     try:
         resp = requests.get(
             "https://api.unsplash.com/search/photos",
@@ -96,6 +152,7 @@ def _try_unsplash(query: str) -> Optional[dict]:
         )
         resp.raise_for_status()
         data = resp.json()
+        candidates = []
         for photo in data.get("results", []):
             w = int(photo.get("width", 0))
             h = int(photo.get("height", 0))
@@ -103,7 +160,7 @@ def _try_unsplash(query: str) -> Optional[dict]:
                 user = photo.get("user", {}) or {}
                 name = user.get("name", "Unknown")
                 username = user.get("username", "")
-                return {
+                candidates.append({
                     "image_url": photo["urls"]["regular"],
                     "credit_text": f"Photo by {name} on Unsplash",
                     "credit_url": (
@@ -114,16 +171,16 @@ def _try_unsplash(query: str) -> Optional[dict]:
                     "width": w,
                     "height": h,
                     "source": "unsplash",
-                }
+                })
+        return candidates
     except Exception:
-        return None
-    return None
+        return []
 
 
-def _try_pexels(query: str) -> Optional[dict]:
-    """Return the first qualifying Pexels result, or None."""
+def _try_pexels(query: str) -> list[dict]:
+    """Return all qualifying Pexels candidates, best first."""
     if not PEXELS_API_KEY:
-        return None
+        return []
     try:
         resp = requests.get(
             "https://api.pexels.com/v1/search",
@@ -133,12 +190,13 @@ def _try_pexels(query: str) -> Optional[dict]:
         )
         resp.raise_for_status()
         data = resp.json()
+        candidates = []
         for photo in data.get("photos", []):
             w = int(photo.get("width", 0))
             h = int(photo.get("height", 0))
             if w >= IMAGE_MIN_WIDTH and h >= IMAGE_MIN_HEIGHT:
                 photographer = photo.get("photographer", "Unknown")
-                return {
+                candidates.append({
                     "image_url": photo["src"]["large"],
                     "credit_text": f"Photo by {photographer} on Pexels",
                     "credit_url": photo.get("photographer_url") or "https://www.pexels.com",
@@ -146,16 +204,16 @@ def _try_pexels(query: str) -> Optional[dict]:
                     "width": w,
                     "height": h,
                     "source": "pexels",
-                }
+                })
+        return candidates
     except Exception:
-        return None
-    return None
+        return []
 
 
-def _try_pixabay(query: str) -> Optional[dict]:
-    """Return the first qualifying Pixabay result, or None."""
+def _try_pixabay(query: str) -> list[dict]:
+    """Return all qualifying Pixabay candidates, best first."""
     if not PIXABAY_API_KEY:
-        return None
+        return []
     try:
         resp = requests.get(
             "https://pixabay.com/api/",
@@ -173,12 +231,13 @@ def _try_pixabay(query: str) -> Optional[dict]:
         )
         resp.raise_for_status()
         data = resp.json()
+        candidates = []
         for photo in data.get("hits", []):
             w = int(photo.get("imageWidth", 0))
             h = int(photo.get("imageHeight", 0))
             if w >= IMAGE_MIN_WIDTH and h >= IMAGE_MIN_HEIGHT:
                 user = photo.get("user", "Unknown")
-                return {
+                candidates.append({
                     "image_url": photo["largeImageURL"],
                     "credit_text": f"Image by {user} on Pixabay",
                     "credit_url": "https://pixabay.com",
@@ -186,16 +245,16 @@ def _try_pixabay(query: str) -> Optional[dict]:
                     "width": w,
                     "height": h,
                     "source": "pixabay",
-                }
+                })
+        return candidates
     except Exception:
-        return None
-    return None
+        return []
 
 
-def _try_serper_image(query: str) -> Optional[dict]:
-    """Try fetching cover image via Google Serper Images API."""
+def _try_serper_image(query: str) -> list[dict]:
+    """Return all qualifying Serper Images candidates, best first."""
     if not SERPER_API_KEY:
-        return None
+        return []
     try:
         url = "https://google.serper.dev/images"
         headers = {
@@ -209,6 +268,7 @@ def _try_serper_image(query: str) -> Optional[dict]:
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
         resp.raise_for_status()
         data = resp.json()
+        candidates = []
         for img in data.get("images", []):
             w = int(img.get("imageWidth", 0))
             h = int(img.get("imageHeight", 0))
@@ -217,7 +277,7 @@ def _try_serper_image(query: str) -> Optional[dict]:
                 title = img.get("title", "")
                 domain = img.get("domain", "Google Images via Serper")
                 link = img.get("link", "")
-                return {
+                candidates.append({
                     "image_url": img["imageUrl"],
                     "credit_text": f"Image from {domain} ({title})" if title else f"Image from {domain}",
                     "credit_url": link or "https://serper.dev",
@@ -225,17 +285,17 @@ def _try_serper_image(query: str) -> Optional[dict]:
                     "width": w,
                     "height": h,
                     "source": "serper",
-                }
+                })
+        return candidates
     except Exception as e:
         print(f"  - [warning] Serper image search failed: {e}", flush=True)
-        return None
-    return None
+        return []
 
 
-def _try_tavily_image(query: str) -> Optional[dict]:
-    """Try fetching cover image via Tavily Search API."""
+def _try_tavily_image(query: str) -> list[dict]:
+    """Return all qualifying Tavily Search image candidates, best first."""
     if not TAVILY_API_KEY:
-        return None
+        return []
     try:
         url = "https://api.tavily.com/search"
         payload = {
@@ -248,24 +308,27 @@ def _try_tavily_image(query: str) -> Optional[dict]:
         resp.raise_for_status()
         data = resp.json()
         images = data.get("images", [])
-        if images:
-            img_url = images[0]
-            from urllib.parse import urlparse
+        candidates = []
+        from urllib.parse import urlparse
+        for img_url in images:
             parsed = urlparse(img_url)
             domain = parsed.netloc or "Tavily Search"
-            return {
+            candidates.append({
                 "image_url": img_url,
                 "credit_text": f"Image from {domain} via Tavily Search",
                 "credit_url": img_url,
                 "photographer": domain,
+                # Tavily doesn't report dimensions; these are placeholders
+                # confirming only that the download itself is validated
+                # against the configured minimums, not actual pixel size.
                 "width": IMAGE_MIN_WIDTH,
                 "height": IMAGE_MIN_HEIGHT,
                 "source": "tavily",
-            }
+            })
+        return candidates
     except Exception as e:
         print(f"  - [warning] Tavily image search failed: {e}", flush=True)
-        return None
-    return None
+        return []
 
 
 @tool("fetch_cover_image", args_schema=ImageQuery)
@@ -273,20 +336,23 @@ def fetch_cover_image(query: str) -> dict:
     """Fetch a landscape cover image for a blog post.
 
     Tries Serper and Tavily web image search first, falling back to Unsplash,
-    Pexels, and Pixabay stock photo APIs. Returns the first valid image
-    above the configured minimum resolution.
+    Pexels, and Pixabay stock photo APIs. Every candidate returned by a
+    provider is actually downloaded and checked to be real, sufficiently
+    large image data before being selected, trying the next candidate (and
+    then the next provider) on failure — this guards against broken or
+    hotlink-blocked URLs (a common cause of a "corrupted" cover image) ever
+    being returned.
 
     Returns a dict with keys: image_url, credit_text, credit_url,
     photographer, width, height, source.
     """
     candidate_queries = _get_image_search_queries(query)
-    
-    # Try candidate queries in priority order across all providers
+
     for q in candidate_queries:
         for fn in (_try_serper_image, _try_tavily_image, _try_unsplash, _try_pexels, _try_pixabay):
-            result = fn(q)
-            if result:
-                return result
+            for candidate in fn(q):
+                if _verify_image_url(candidate["image_url"]):
+                    return candidate
 
     # Graceful fallback — caller should still get a well-formed dict.
     return {
