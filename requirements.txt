@@ -1,0 +1,25 @@
+# Core LangChain (1.0+ — uses LangGraph as the agent runtime)
+langchain>=1.0.0
+langchain-core>=1.0.0
+langchain-community>=0.2.0
+langgraph>=0.2.0
+
+# LLM provider — Ollama (local) / OpenAI-compatible proxies
+langchain-ollama>=0.3.0
+langchain-openai>=0.1.0
+
+# Search tool integrations (built-in LangChain tools)
+langchain-tavily>=0.2.0
+wikipedia>=1.4
+duckduckgo-search>=6.0
+arxiv>=2.1
+
+# Memory layer — self-hosted Mem0 with local Chroma vector store
+mem0ai>=0.1.50
+chromadb>=0.5.0
+sentence-transformers>=2.2.0
+
+# Supporting libraries
+pydantic>=2.0
+python-dotenv>=1.0
+requests>=2.31
